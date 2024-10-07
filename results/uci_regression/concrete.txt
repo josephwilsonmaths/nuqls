@@ -1,0 +1,43 @@
+Training, Val, Test points = 721, 154, 155
+Number of hidden units, parameters = [150], 1501
+
+--- MAP Training Details --- 
+training: epochs, de_epochs, lr, weight decay, batch size = 1500, 300, 0.001, 1e-05
+
+ --- NUQLs Details --- 
+epochs: 3000; S: 10; lr: 0.001; epochs: 3000
+
+--- Method MAP ---
+
+ - Train Results: - 
+loss: 0.034 +- 0.003 
+
+--- Method NUQLs ---
+
+ - Train Results: - 
+loss: 0.117 +- 0.023 
+
+ - Test Prediction: - 
+rmse: 0.318 +- 0.034 
+nll: -0.426 +- 0.280 
+ece: 0.002 +- 0.002 
+time: 00:00:24
+
+--- Method DE ---
+
+ - Train Results: - 
+loss: -0.942 +- 0.038 
+
+ - Test Prediction: - 
+rmse: 0.345 +- 0.036 
+nll: -0.649 +- 0.068 
+ece: 0.002 +- 0.003 
+time: 00:00:56
+
+--- Method LLA ---
+
+ - Test Prediction: - 
+rmse: 0.302 +- 0.039 
+nll: -0.610 +- 0.212 
+ece: 0.005 +- 0.002 
+time: 00:00:05
