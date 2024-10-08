@@ -1,30 +1,13 @@
 import torch
-import importlib
 import numpy as np
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, Subset
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from preds.likelihoods import Categorical
+from torch.utils.data import DataLoader
+from posteriors.lla.likelihoods import Categorical
 import sklearn.metrics as sk
-import scipy
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
-import time
-import datetime
-import os
-import solvers as solv
-import definitions as df
-from importlib import reload
-from scipy.special import digamma, polygamma
+import posteriors.util as df
 
-reload(solv)
-reload(df)
-
-from scipy.sparse.linalg import LinearOperator, lsmr
 import tqdm
-from torch.func import vmap, jacrev
-from functorch import make_functional, make_functional_with_buffers
 
 device = (
     "cuda"
@@ -216,85 +199,6 @@ def training(train_loader, test_loader, model, loss_fn, optimizer, scheduler = N
         print("Final test accuracy = {:.1f}%".format(100*test_acc))
     return train_loss, train_acc, test_loss, test_acc
 
-def to_np(x):
-    return x.cpu().detach().numpy()
-
-class CustomNLL(torch.nn.Module):
-    def __init__(self):
-        super(CustomNLL, self).__init__()
-
-    def forward(self, y, mean, var):
-        
-        loss = (0.5*torch.log(var) + 0.5*(y - mean).pow(2)/var).mean() + 1
-
-        if np.any(np.isnan(to_np(loss))):
-            print(torch.log(var))
-            print((y - mean).pow(2)/var)
-            raise ValueError('There is Nan in loss')
-        
-        return loss
-
-class Reshape(torch.nn.Module):
-    def forward(self, x):
-        return x.view(-1, 1, 28, 28)
-
-class LeNet5(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            # Reshape(),
-            nn.Conv2d(1, 6, kernel_size=5, padding=2),
-            nn.Sigmoid(),
-            nn.AvgPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(6, 16, kernel_size=5),
-            nn.Sigmoid(),
-            nn.AvgPool2d(kernel_size=2, stride=2),
-            nn.Flatten(),
-            nn.Linear(16 * 5 * 5, 120),
-            nn.Sigmoid(),
-            nn.Linear(120, 84),
-            nn.Sigmoid(),
-            nn.Linear(84, 10),
-        )
-
-    def forward(self,x):
-        return self.net(x)
-    
-def init_weights(m):
-    if type(m) == nn.Linear or type(m) == nn.Conv2d:
-        nn.init.xavier_uniform_(m.weight)
-
-class LeNet5_Dropout(nn.Module):
-    def __init__(self,p=0.5):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            Reshape(),
-            nn.Conv2d(1, 6, kernel_size=5, padding=2),
-            nn.Sigmoid(),
-            nn.AvgPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(6, 16, kernel_size=5),
-            nn.Sigmoid(),
-            nn.AvgPool2d(kernel_size=2, stride=2),
-            nn.Flatten(),
-            nn.Linear(16 * 5 * 5, 120),
-            nn.Sigmoid(),
-            nn.Linear(120, 84),
-            nn.Sigmoid(),
-            nn.Dropout(p),
-            nn.Linear(84, 10),
-        )
-
-    def forward(self,x):
-        return self.net(x)
-
-class Reshape(torch.nn.Module):
-    def forward(self, x):
-        return x.view(-1, 1, 28, 28)
-    
-def init_weights(m):
-    if type(m) == nn.Linear or type(m) == nn.Conv2d:
-        nn.init.xavier_uniform_(m.weight)
-
 def test_sampler(model,test,bs,probit=False):
     predictions = []
     test_dataloader = DataLoader(test,bs)
@@ -477,197 +381,6 @@ def dirichlet_uncertainty(id_prob, ood_prob, ratio=True):
     else:
         return (po - pi) / pi
 
-# def dir_conc(p,epoch_last=100,tol=1e-9,verbose=False):
-#     '''
-#     Input
-#         p: simplex values. Should be in shape (s x d), where n is number of samples, and d-1 is dimension of simplex. type = numpy.
-#     '''
-#     n,d = p.shape
-#     alpha_0 = np.empty(d)
-#     for k in range(d):
-#         alpha_0[k] = (p[:,0].mean(0) - np.square(p[:,0]).mean(0)) * p[:,k].mean(0) / (np.square(p[:,0]).mean(0) - p[0,0]**2)
-#         if alpha_0[k] < 0 or np.isnan(alpha_0[k]):
-#             alpha_0[k] = np.min(p[:,k])
-
-#     # Initial check
-#     s = sum(alpha_0)
-#     qinv = 1 / (-n * polygamma(1,alpha_0))
-#     Qinv = np.diag(qinv)
-#     one = np.ones((d,1))
-#     c = n * polygamma(1,s)
-#     if (1/c + one.T @ Qinv @ one) == 0:
-#         alpha_0 = np.ones(d)*10
-
-#     alpha_i = alpha_0
-#     lp = dirichlet_logprob(p,alpha_i)
-#     for i in range(epoch_last):
-#         s = sum(alpha_i)
-#         grad_fk = n * (digamma(s) - digamma(alpha_i) + 1/n * np.sum(np.log(p),axis=0))
-#         qinv = 1 / (-n * polygamma(1,alpha_i))
-#         Qinv = np.diag(qinv)
-#         one = np.ones((d,1))
-#         c = n * polygamma(1,s)
-
-#         Hinv = Qinv - (Qinv @ (one @ (one.T @ Qinv))) / (1/c + one.T @ Qinv @ one)
-#         alpha_old = alpha_i
-#         grad = Hinv @ grad_fk
-#         alpha_i = alpha_old - grad
-
-#         if alpha_i.min() < 0:
-#             if verbose:
-#                 print(f"negative alpha_i = {alpha_i[alpha_i < 0]}")
-#             if len(alpha_i[alpha_i<0]) > 0:
-#                 alpha_i[alpha_i<0] = 0.01
-
-#         lp_old = lp
-#         lp = dirichlet_logprob(p,alpha_i)
-#         resid = np.square(lp - lp_old)
-#         if verbose:
-#             print(f"it: {i}, resid: {np.linalg.norm(resid)}")
-#         if resid<tol:
-#             if verbose:   
-#                 print(f"it: {i}, resid: {np.linalg.norm(resid)}, log_prob: {lp}")
-#                 print(f"final s = {alpha_i.sum()}")
-#             return alpha_i
-#     if verbose:   
-#         print(f"it: {i}, resid: {np.linalg.norm(resid)}, log_prob: {lp}")
-#         print(f"final s = {alpha_i.sum()}")
-#     return alpha_i
-
-def dir_conc(p,epoch_last=100,tol=1e-9,verbose=False):
-    '''
-    Input
-        p: simplex values. Should be in shape (n x d), where n is number of samples, and d-1 is dimension of simplex. type = numpy.
-    '''
-    var_check = 1e-5
-    n,d = p.shape
-    alpha_0 = np.empty(d)
-    for k in range(d):
-        alpha_0[k] = (p[:,0].mean(0) - np.square(p[:,0]).mean(0)) * p[:,k].mean(0) / (np.square(p[:,0]).mean(0) - p[0,0]**2)
-        if alpha_0[k] < 0 or np.isnan(alpha_0[k]):
-            alpha_0[k] = np.min(p[:,k])
-
-    check_fail = 0
-    # Initial check
-    s = sum(alpha_0)
-    qinv = 1 / (-n * polygamma(1,alpha_0))
-    Qinv = np.diag(qinv)
-    one = np.ones((d,1))
-    c = n * polygamma(1,s)
-    if (1/c + one.T @ Qinv @ one) == 0:
-        alpha_0 = np.ones(d)*10
-
-    alpha_i = alpha_0
-    lp = dirichlet_logprob(p,alpha_i)
-    for i in range(epoch_last):
-        s = sum(alpha_i)
-        grad_fk = n * (digamma(s) - digamma(alpha_i) + 1/n * np.sum(np.log(p),axis=0))
-        qinv = 1 / (-n * polygamma(1,alpha_i))
-        Qinv = np.diag(qinv)
-        one = np.ones((d,1))
-        c = n * polygamma(1,s)
-        if (1/c + one.T @ Qinv @ one) == 0:
-            alpha_i[alpha_i<1e-10] = 0.01
-            alpha_i[alpha_i>1e10] = 1e2
-            qinv = 1 / (-n * polygamma(1,alpha_i))
-            Qinv = np.diag(qinv)
-            one = np.ones((d,1))
-            s = sum(alpha_i)
-            c = n * polygamma(1,s)
-
-        # if (1/c + one.T @ Qinv @ one) == 0:
-        #     check_fail += 1
-        #     if p.var(0).sum() < var_check:
-        #         if verbose:
-        #             print('low variance')
-        #         return 1 / p.var(0), 0
-        #     else:
-        #         if verbose:
-        #             print(f'check failed {check_fail}')
-        #         else:
-        #             print(f'check failed {check_fail}')
-        #             print(alpha_i)
-        #             print(f'variance = {p.var(0).sum()}')
-        #             print(f'max prob = {np.max(p.mean(0))}')
-        #         alpha_i[alpha_i>1e10] = 1e2
-        #         qinv = 1 / (-n * polygamma(1,alpha_i))
-        #         Qinv = np.diag(qinv)
-        #         one = np.ones((d,1))
-        #         s = sum(alpha_i)
-        #         c = n * polygamma(1,s)
-
-        Hinv = Qinv - (Qinv @ (one @ (one.T @ Qinv))) / (1/c + one.T @ Qinv @ one + 1e-17)
-        alpha_old = alpha_i
-        grad = Hinv @ grad_fk
-        alpha_i = alpha_old - grad
-
-        if alpha_i.min() < 0:
-            if verbose:
-                print(f"negative alpha_i = {alpha_i[alpha_i < 0]}")
-            if len(alpha_i[alpha_i<0]) > 0:
-                alpha_i[alpha_i<0] = 0.01
-
-        lp_old = lp
-        lp = dirichlet_logprob(p,alpha_i)
-        resid = np.square(lp - lp_old)
-        if verbose:
-            print(f"it: {i}, resid: {np.linalg.norm(resid)}")
-        if resid<tol:
-            if verbose:   
-                print(f"it: {i}, resid: {np.linalg.norm(resid)}, log_prob: {lp}")
-                print(f"final s = {alpha_i.sum()}")
-            return alpha_i, resid
-    if verbose:   
-        print(f"it: {i}, resid: {np.linalg.norm(resid)}, log_prob: {lp}")
-        print(f"final s = {alpha_i.sum()}")
-    return alpha_i, resid
-
-def evaluate_conc(predictions, it=100, tol=1e-9, precision=False, verbose=False, progress_bar=True):
-    '''
-    INPUT - (S x N x C)
-        predictions: must be np.array in shape (S x N x C), where S is number of samples, N is number of test points,
-                    and C is number of classes.
-        precision: if True, will return array of precision values. if False, will return array of inverse-precision (variace) values.
-    
-    OUTPUT
-        returns array of precision / inverse-precision values for each test point.
-    '''
-
-    dirac_tol = 1 - 1e-3
-    dirac_s = 1e7
-    predictions = array_to_numpy(predictions)
-    S, N, C = predictions.shape
-    s = np.empty(N)
-
-    if progress_bar:
-        pbar = tqdm.trange(N)
-    else:
-        pbar = range(N)
-
-    for i in pbar:
-        p = predictions[:,i,:]
-        if np.max(p.mean(0)) > dirac_tol:
-            if verbose:
-                print('skipped')
-            if precision:
-                s[i] = dirac_s
-            else:
-                s[i] = 1 / dirac_s
-        else:
-            # print(f"max prob = {np.max(p.mean(0))}")
-            alpha, resid = dir_conc(p,epoch_last=it,tol=tol,verbose=False)
-            if verbose:
-                print(f'resid: {resid}')
-            if resid > tol:
-                print(f"resid: {resid}")
-            if len(alpha[alpha<0]):
-                print("Error - negative alpha")
-            if precision:
-                s[i] = alpha.sum()
-            else:
-                s[i] = 1 / alpha.sum()
-    return s
-
 def array_to_numpy(x):
     if torch.is_tensor(x):
         return x.detach().cpu().numpy()
@@ -675,66 +388,6 @@ def array_to_numpy(x):
         return x
     else:
         return 'ERR'
-    
-def dirichlet_logprob(p,alpha):
-    N = p.shape[0]
-    return N*(np.log(alpha.sum()) - np.log(alpha).sum() + ((alpha - 1) * (1/N * np.log(p).sum(0))).sum())
-
-def boxplot_var(var_dict,probit_sum=True, title=None, save_file=None, show=False):
-    plt.close()
-    
-    
-    ticks = list(var_dict.keys())
-    
-    id_var_list = []
-    ood_var_list = []
-    for key in var_dict.keys():
-        pi = array_to_numpy(var_dict[key]['id'])
-        po = array_to_numpy(var_dict[key]['ood'])
-        if probit_sum:
-            pi = pi.sum(1)
-            po = po.sum(1)
-        id_var_list.append(pi.tolist())
-        ood_var_list.append(po.tolist())
-
-    id_vars_plot = plt.boxplot(id_var_list,
-                                positions=np.array(
-        np.arange(len(id_var_list)))*2.0-0.35, 
-                                widths=0.6,
-                    flierprops={'marker': 'o', 'markersize': 0.1, 'markerfacecolor': 'fuchsia'})
-    ood_vars_plot = plt.boxplot(ood_var_list,
-                                positions=np.array(
-        np.arange(len(ood_var_list)))*2.0+0.35,
-                                widths=0.6,
-                    flierprops={'marker': 'o', 'markersize': 0.1, 'markerfacecolor': 'fuchsia'})
-
-    def define_box_properties(plot_name, color_code, label):
-        for k, v in plot_name.items():
-            plt.setp(plot_name.get(k), color=color_code)
-            
-        # use plot function to draw a small line to name the legend.
-        plt.plot([], c=color_code, label=label)
-        plt.legend()
-    
-    # setting colors for each groups
-    define_box_properties(id_vars_plot, '#D7191C', 'ID')
-    define_box_properties(ood_vars_plot, '#2C7BB6', 'OOD')
-    
-    plt.xticks(np.arange(0, len(ticks) * 2, 2), ticks)
-    plt.xlim(-2, len(ticks)*2)
-    
-    if title is not None:
-        plt.title(title)
-
-    plt.plot()
-
-    if save_file is not None:
-        plt.savefig(fname=save_file,format='pdf')
-        
-    if show:
-        plt.show()
-
-    plt.close()
 
 def violin_var(var_dict,probit_sum=True, title=None, save_file=None, show=False, text=False):
     plt.close()
@@ -819,14 +472,6 @@ def violin_var(var_dict,probit_sum=True, title=None, save_file=None, show=False,
         plt.show()
 
     plt.close()
-
-# def correct_sort(preds,test_data):
-#     '''
-#     preds must be in shape N x C x S
-#     '''
-#     test_loader = DataLoader(test_data,len(test_data))
-#     _,y = next(iter(test_loader))
-#     return preds[preds.mean(2).argmax(1).cpu()==y]
 
 def sort_preds(pi,yi):
     index = (pi.mean(0).argmax(1) == yi)

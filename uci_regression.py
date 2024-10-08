@@ -8,11 +8,10 @@ import scipy
 from scipy.io import arff
 import torch.nn.functional as F
 from tqdm import tqdm
-import nuqls as ntk
-import preds as preds
-from preds.models import MLPS
-from preds.likelihoods import GaussianLh
-from preds.laplace import Laplace
+import posteriors.nuqls as ntk
+from posteriors.lla.models import MLPS
+from posteriors.lla.likelihoods import GaussianLh
+from posteriors.lla.laplace import Laplace
 import argparse
 import time
 import os

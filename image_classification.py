@@ -1,12 +1,10 @@
-### Setup data,model,ntk method
-
 import torch
 import torchvision.transforms as transforms
 from torchvision.transforms import ToTensor
 from torchvision import datasets
 from tqdm import tqdm
 import definitions_2 as df2
-import nuqls as ntk
+import posteriors.nuqls as nuqls
 from tqdm import tqdm
 import numpy as np
 import models as model
@@ -14,8 +12,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 from laplace import Laplace
 import os
-import swag as swag
-from preds.likelihoods import Categorical
+import posteriors.swag as swag
+from posteriors.lla.likelihoods import Categorical
 import time
 import datetime
 from torchmetrics.classification import MulticlassCalibrationError, MulticlassAUROC
@@ -46,15 +44,14 @@ parser.add_argument('--epochs', default=10, type=int, help='number of epochs for
 parser.add_argument('--wd',default=1e-4,type=float,help='wd for training networks.')
 parser.add_argument('--lr',default=5e-3,type=float,help='lr for training networks.')
 parser.add_argument('--bs', default=100, type=int, help='batch size for training networks.')
-parser.add_argument('--ntk_epoch',default=1000,type=int,help='epochs for ntk gd method.')
-parser.add_argument('--ntk_S',default=10,type=int,help='num realisations for ntk gd method.')
-parser.add_argument('--ntk_lr',default=1e-1,type=float,help='lr for ntk gd method.')
-parser.add_argument('--ntk_bs',default=100,type=int,help='batch size for ntk gd method.')
-parser.add_argument('--ntk_wd',default=0,type=float,help='wd for ntk gd method.')
-parser.add_argument('--ntk_scale',default=1,type=float,help='init scale for ntk gd method.')
-parser.add_argument('--ntk_he', action='store_true', help='if included will do He initialisation for linear realisations for ntk gd method')
+parser.add_argument('--nuqls_epoch',default=1000,type=int,help='epochs for nuqls.')
+parser.add_argument('--nuqls_S',default=10,type=int,help='num realisations for nuqls.')
+parser.add_argument('--nuqls_lr',default=1e-1,type=float,help='lr for nuqls.')
+parser.add_argument('--nuqls_bs',default=100,type=int,help='batch size for nuqls.')
+parser.add_argument('--nuqls_wd',default=0,type=float,help='wd for nuqls.')
+parser.add_argument('--nuqls_gamma',default=1,type=float,help='init scale for nuqls.')
 parser.add_argument('--progress', action='store_false')
-parser.add_argument('--lla_incl', action='store_true', help='if flag is included, lla will run (bugs out with ntk)')
+parser.add_argument('--lla_incl', action='store_true', help='if flag is included, lla will run (bugs out with nuqls)')
 args = parser.parse_args()
 
 
@@ -222,7 +219,7 @@ for ei in tqdm(range(args.n_experiment)):
         t1 = time.time()
         if m == 'MAP':
             if args.model == 'lenet':
-                map_net = df2.LeNet5().to(device)
+                map_net = model.LeNet5().to(device)
             elif args.model == 'resnet9':
                 map_net = model.ResNet9(in_channels=n_channels, num_classes=n_output).to(device)
             elif args.model == 'wrn':
@@ -256,32 +253,31 @@ for ei in tqdm(range(args.n_experiment)):
             ood_mean = df2.test_sampler(map_net, ood_test_data, bs=batch_size, probit=True)
 
         elif m == 'NUQLs':
-            S = args.ntk_S
+            S = args.nuqls_S
             if S > 10:
-                ntk_linear_method = ntk.linear_ntk_c(net = map_net, train = training_data, S = S, epochs=args.ntk_epoch, lr=args.ntk_lr, n_output=n_output, 
-                                                        bs=args.ntk_bs, bs_test=args.ntk_bs, init_scale=args.ntk_scale)
-                ntk_predictions, ood_ntk_predictions, res = ntk_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
-                                                                                    weight_decay=args.ntk_wd, verbose=args.verbose, progress_bar=args.progress, gradnorm=True, 
-                                                                                    netbase=args.model if args.ntk_he else None, in_channels=n_channels, 
-                                                                                    num_classes=n_output) # S x N x C
-                del ntk_linear_method
+                nuqls_linear_method = nuqls.linear_nuqls_c(net = map_net, train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
+                                                        bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_gamma)
+                nuqls_predictions, ood_nuqls_predictions, res = nuqls_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
+                                                                                    weight_decay=args.nuqls_wd, verbose=args.verbose, progress_bar=args.progress, gradnorm=True, 
+                                                                                    ) # S x N x C
+                del nuqls_linear_method
             else:
-                ntk_predictions, ood_ntk_predictions, res = ntk.linear_sampling(net = map_net, train_data = training_data, test_data = test_data, 
-                                                                            ood_test_data=ood_test_data, train_bs = args.ntk_bs, test_bs = args.ntk_bs, 
-                                                                            S = S, scale=args.ntk_scale, lr=args.ntk_lr, epochs=args.ntk_epoch, mu=0.9, 
-                                                                            wd = args.ntk_wd, verbose = False, progress_bar = True) # S x N x C
+                nuqls_predictions, ood_nuqls_predictions, res = nuqls.linear_sampling(net = map_net, train_data = training_data, test_data = test_data, 
+                                                                            ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
+                                                                            S = S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
+                                                                            wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C
             print(res['loss'])
             print(res['acc'])
 
             train_res[m]['nll'].append(res['loss'])
             train_res[m]['acc'].append(res['acc'])
 
-            id_mean = ntk_predictions.softmax(dim=2).mean(dim=0)
-            id_var = ntk_predictions.softmax(dim=2).var(dim=0)
-            ood_mean = ood_ntk_predictions.softmax(dim=2).mean(dim=0)
-            ood_var = ood_ntk_predictions.softmax(dim=2).var(dim=0)
-            id_predictions = ntk_predictions.softmax(dim=2)
-            ood_predictions = ood_ntk_predictions.softmax(dim=2)
+            id_mean = nuqls_predictions.softmax(dim=2).mean(dim=0)
+            id_var = nuqls_predictions.softmax(dim=2).var(dim=0)
+            ood_mean = ood_nuqls_predictions.softmax(dim=2).mean(dim=0)
+            ood_var = ood_nuqls_predictions.softmax(dim=2).var(dim=0)
+            id_predictions = nuqls_predictions.softmax(dim=2)
+            ood_predictions = ood_nuqls_predictions.softmax(dim=2)
 
         elif m == 'DE':
             model_list = []
@@ -289,7 +285,7 @@ for ei in tqdm(range(args.n_experiment)):
             sched_list = []
             for i in range(M):
                 if args.model == 'lenet':
-                    model_list.append(df2.LeNet5().to(device))
+                    model_list.append(model.LeNet5().to(device))
                 elif args.model == 'resnet9':
                     model_list.append(model.ResNet9(in_channels=n_channels, num_classes = n_output).to(device))
                 elif args.model == 'wrn':
@@ -330,32 +326,31 @@ for ei in tqdm(range(args.n_experiment)):
                                                     bs=batch_size)
     
         elif m == 'eNUQLs':
-            S = args.ntk_S
+            S = args.nuqls_S
             id_preds = []
             ood_preds = []
             for i in range(M):
                 if S > 10:
-                    ntk_linear_method = ntk.linear_ntk_c(net = model_list[i], train = training_data, S = S, epochs=args.ntk_epoch, lr=args.ntk_lr, n_output=n_output, 
-                                                            bs=args.ntk_bs, bs_test=args.ntk_bs, init_scale=args.ntk_scale)
-                    ntk_predictions, ood_ntk_predictions, res = ntk_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
-                                                                                        weight_decay=args.ntk_wd, verbose=args.verbose, progress_bar=args.progress, gradnorm=True, 
-                                                                                        netbase=args.model if args.ntk_he else None, in_channels=n_channels, 
-                                                                                        num_classes=n_output) # S x N x C
-                    del ntk_linear_method
+                    nuqls_linear_method = nuqls.linear_nuqls_c(net = model_list[i], train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
+                                                            bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_scale)
+                    nuqls_predictions, ood_nuqls_predictions, res = nuqls_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
+                                                                                        weight_decay=args.nuqls_wd, verbose=args.verbose, 
+                                                                                        progress_bar=args.progress, gradnorm=True) # S x N x C
+                    del nuqls_linear_method
                 else:
-                    ntk_predictions, ood_ntk_predictions, res = ntk.linear_sampling(net = model_list[i], train_data = training_data, test_data = test_data, 
-                                                                                ood_test_data=ood_test_data, train_bs = args.ntk_bs, test_bs = args.ntk_bs, 
-                                                                                S = S, scale=args.ntk_scale, lr=args.ntk_lr, epochs=args.ntk_epoch, mu=0.9, 
-                                                                                wd = args.ntk_wd, verbose = False, progress_bar = True) # S x N x C
+                    nuqls_predictions, ood_nuqls_predictions, res = nuqls.linear_sampling(net = model_list[i], train_data = training_data, test_data = test_data, 
+                                                                                ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
+                                                                                S = S, scale=args.nuqls_scale, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
+                                                                                wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C
                 print(res['loss'])
                 print(res['acc'])
 
                 train_res[m]['nll'].append(res['loss'])
                 train_res[m]['acc'].append(res['acc'])
 
-                id_predictions = ntk_predictions.softmax(dim=2)
+                id_predictions = nuqls_predictions.softmax(dim=2)
                 id_preds.append(id_predictions)
-                ood_predictions = ood_ntk_predictions.softmax(dim=2)
+                ood_predictions = ood_nuqls_predictions.softmax(dim=2)
                 ood_preds.append(ood_predictions)
             id_predictions = torch.cat(id_preds,dim=0)
             ood_predictions = torch.cat(ood_preds,dim=0)
@@ -414,7 +409,7 @@ for ei in tqdm(range(args.n_experiment)):
             p = 0.25
 
             if args.model == 'lenet':
-                mc_net = df2.LeNet5_Dropout(p=p).to(device)
+                mc_net = model.LeNet5_Dropout(p=p).to(device)
             elif args.model == 'resnet9':
                 mc_net = model.ResNet9(in_channels=n_channels, num_classes=n_output, p=p).to(device)
             elif args.model == 'wrn':
@@ -502,8 +497,8 @@ percentage_metrics = ['acc','ece','oodauc','aucroc']
 results.write(" --- MAP Training Details --- \n")
 results.write(f"epochs: {epochs}; M: {M}; lr: {learning_rate}; weight_decay: {weight_decay}\n")
 
-results.write("\n --- NTK-UQ-Linear Details --- \n")
-results.write(f"epochs: {args.ntk_epoch}; S: {M}; lr: {args.ntk_lr}; weight_decay: {args.ntk_wd}; init scale: {'He initialisation' if args.ntk_he else args.ntk_scale}\n")
+results.write("\n --- NUQLS Details --- \n")
+results.write(f"epochs: {args.nuqls_epoch}; S: {M}; lr: {args.nuqls_lr}; weight_decay: {args.nuqls_wd}; init scale: {args.nuqls_scale}\n")
 
 for m in methods:
     if args.n_experiment > 1:
