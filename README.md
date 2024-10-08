@@ -1,3 +1,4 @@
+# Uncertainty Quantification with the Empirical Neural Tangent Kernel
 Code repository for experiments and figures in the main text of the paper "Uncertainty Quantification with the Empirical Neural Tangent Kernel".
 
 ## Setup
