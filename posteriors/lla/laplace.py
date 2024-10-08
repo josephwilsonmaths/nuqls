@@ -5,13 +5,10 @@ from torch.distributions import Normal
 from backpack import backpack, extend
 from backpack.extensions import DiagGGNExact, KFLR
 
-import lla as lla
-from importlib import reload
-reload(lla)
-from lla.optimizers import GGN
-from lla.predictives import functional_sampling_predictive, nn_sampling_predictive
-from lla.kron import Kron
-from lla.gps import gp_quantities, GP_predictive, mc_preds
+from posteriors.lla.optimizers import GGN
+from posteriors.lla.predictives import functional_sampling_predictive, nn_sampling_predictive
+from posteriors.lla.kron import Kron
+from posteriors.lla.gps import gp_quantities, GP_predictive, mc_preds
 
 
 def diag_ggn(model):

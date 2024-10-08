@@ -8,7 +8,7 @@ import scipy
 from scipy.io import arff
 import torch.nn.functional as F
 from tqdm import tqdm
-import posteriors.nuqls as ntk
+import posteriors.nuqls as nuqls
 from posteriors.lla.models import MLPS
 from posteriors.lla.likelihoods import GaussianLh
 from posteriors.lla.laplace import Laplace
@@ -22,9 +22,9 @@ parser = argparse.ArgumentParser(description='Regression Experiment')
 parser.add_argument('--dataset', required=True,type=str,help='Dataset')
 parser.add_argument('--n_experiment',default=10,type=int,help='number of experiments')
 parser.add_argument('--activation',default='tanh',type=str,help='Non-linear activation for MLP')
-parser.add_argument('--ntk_epoch',default=1000,type=int,help='epochs for ntk gd method.')
-parser.add_argument('--ntk_S',default=100,type=int,help='num realisations for ntk gd method.')
-parser.add_argument('--ntk_lr',default=5e-4,type=float,help='lr for ntk gd method.')
+parser.add_argument('--nuqls_epoch',default=1000,type=int,help='epochs for nuqls.')
+parser.add_argument('--nuqls_S',default=100,type=int,help='num realisations for nuqls.')
+parser.add_argument('--nuqls_lr',default=5e-4,type=float,help='lr for nuqls.')
 args = parser.parse_args()
 
 # Get cpu, gpu or mps device for training.
@@ -308,24 +308,24 @@ for ei in tqdm(range(args.n_experiment)):
             scales = torch.linspace(0,1,20)
 
             for s,scale in enumerate(scales):
-                ntk_linear_method = ntk.linear_ntk_small(net = map_net, train = train_dataset, S = args.ntk_S, epochs=args.ntk_epoch, lr=args.ntk_lr, bs=train_size, bs_test=test_size,init_scale=scale)
-                new_ntk_predictions,_,_ = ntk_linear_method.method(validation_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
-                new_observed_conf_ntk, new_predicted_conf = calibration_curve_r(calibration_test_loader_val,new_ntk_predictions.mean(1),new_ntk_predictions.var(1),11)
-                new_ece_ntk = torch.mean(torch.square(new_observed_conf_ntk - new_predicted_conf))
-                if new_ece_ntk < best_ece:
-                    best_ece = new_ece_ntk
-                    ntk_predictions = new_ntk_predictions
+                nuqls_model = nuqls.linear_nuqls_small(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=scale)
+                new_nuqls_predictions,_,_ = nuqls_model.method(validation_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
+                new_observed_conf_nuqls, new_predicted_conf = calibration_curve_r(calibration_test_loader_val,new_nuqls_predictions.mean(1),new_nuqls_predictions.var(1),11)
+                new_ece_nuqls = torch.mean(torch.square(new_observed_conf_nuqls - new_predicted_conf))
+                if new_ece_nuqls < best_ece:
+                    best_ece = new_ece_nuqls
+                    nuqls_predictions = new_nuqls_predictions
                     best_scale = scale
-                    # print("New best ece = {}".format(new_ece_ntk))
+                    # print("New best ece = {}".format(new_ece_nuqls))
                     # print("New best scale = {}".format(best_scale))
                 else:
                     break
 
-            ntk_linear_method = ntk.linear_ntk_small(net = map_net, train = train_dataset, S = args.ntk_S, epochs=args.ntk_epoch, lr=args.ntk_lr, bs=train_size, bs_test=test_size,init_scale=best_scale)
-            ntk_predictions, max_l2_loss, norm_resid = ntk_linear_method.method(test_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
+            nuqls_model = nuqls.linear_nuqls_small(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=best_scale)
+            nuqls_predictions, max_l2_loss, norm_resid = nuqls_model.method(test_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
 
-            mean_pred = ntk_predictions.mean(1)
-            var_pred = ntk_predictions.var(1)
+            mean_pred = nuqls_predictions.mean(1)
+            var_pred = nuqls_predictions.var(1)
 
             train_res['NUQLs']['loss'].append(max_l2_loss.detach().cpu().item())
 
@@ -462,7 +462,7 @@ results.write("training: epochs, de_epochs, lr, weight decay, batch size = {}, {
 ))
 
 results.write("\n --- NUQLs Details --- \n")
-results.write(f"epochs: {args.ntk_epoch}; S: {M}; lr: {args.ntk_lr}; epochs: {args.ntk_epoch}\n")
+results.write(f"epochs: {args.nuqls_epoch}; S: {M}; lr: {args.nuqls_lr}; epochs: {args.nuqls_epoch}\n")
 
 for m in methods:
     if args.n_experiment > 1:

@@ -3,10 +3,10 @@ from torch.distributions import MultivariateNormal, Normal
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 import logging
 
-from lla.gradients import Jacobians
-from lla.optimizers import GGN
-from lla.likelihoods import get_Lams_Vys, GaussianLh
-from lla.kron import Kron
+from posteriors.lla.gradients import Jacobians
+from posteriors.lla.optimizers import GGN
+from posteriors.lla.likelihoods import get_Lams_Vys, GaussianLh
+from posteriors.lla.kron import Kron
 
 
 def nn_sampling_predictive(X, model, likelihood, mu, Sigma_chol, mc_samples=100, no_link=False):

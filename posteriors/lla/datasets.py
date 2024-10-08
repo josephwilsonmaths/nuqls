@@ -9,7 +9,7 @@ import torch.utils.data as data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 
-from lla import DATA_DIR
+from posteriors.lla import DATA_DIR
 
 CIFAR10_transform = transforms.Compose([
     transforms.ToTensor(),

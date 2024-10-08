@@ -14,9 +14,9 @@ from contextlib import contextmanager
 import itertools
 from copy import deepcopy
 
-from lla.gradients import Jacobians_gp
+from posteriors.lla.gradients import Jacobians_gp
 
-from lla.likelihoods import BernoulliLh, CategoricalLh
+from posteriors.lla.likelihoods import BernoulliLh, CategoricalLh
 
 log2pi = np.log(2 * np.pi)
 

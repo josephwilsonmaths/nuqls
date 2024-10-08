@@ -5,8 +5,6 @@ from torch import nn
 from torch.utils.data import DataLoader
 import tqdm
 import copy
-import definitions_2 as df2
-from importlib import reload
 
 torch.set_default_dtype(torch.float64)
 

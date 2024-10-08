@@ -1,7 +1,14 @@
 import torch
 import copy
-import definitions_2 as df2
 import tqdm
+
+device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
 
 def swag_parameters(module, params, cov_mat=True):
     for name in list(module._parameters.keys()):
@@ -75,8 +82,8 @@ class SWAG(torch.nn.Module):
         else:
             pbar = range(self.epochs)
         for _ in pbar:
-            df2.train_loop(dataloader=train_dataloader, model=self.swag_net, loss_fn=self.loss_fn,
-                        optimizer=self.optimizer, scheduler=None, train_mode=True)
+            train_loop(dataloader=train_dataloader, model=self.swag_net, loss_fn=self.loss_fn,
+                        optimizer=self.optimizer, scheduler=None)
             self.collect_model()
         
     def collect_model(self):
@@ -360,3 +367,31 @@ class SWAG_R(torch.nn.Module):
 
         for (module, name), sample in zip(self.params, samples_list):
             module.__setattr__(name, torch.nn.parameter.Parameter(sample))
+
+def train_loop(dataloader, model, loss_fn, optimizer, scheduler):
+        model.train()
+        size = len(dataloader.dataset)
+        num_batches = len(dataloader)    
+        train_loss, correct = 0, 0
+        for _, (X, y) in enumerate(dataloader):
+            X,y = X.to(device), y.to(device)
+            # Compute prediction and loss
+            pred = model(X)
+            loss = loss_fn(pred, y)
+
+            # Backpropagation
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Evaluate metrics
+            train_loss += loss.item()
+            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        train_loss /= num_batches
+        correct /= size
+
+        return train_loss, correct

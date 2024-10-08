@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from lla.likelihoods import BernoulliLh, Bernoulli, CategoricalLh, Categorical
+from posteriors.lla.likelihoods import BernoulliLh, Bernoulli, CategoricalLh, Categorical
 
 
 def acc(g, y, likelihood=None):

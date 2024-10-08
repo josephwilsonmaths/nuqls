@@ -3,22 +3,24 @@ import torchvision.transforms as transforms
 from torchvision.transforms import ToTensor
 from torchvision import datasets
 from tqdm import tqdm
-import definitions_2 as df2
-import posteriors.nuqls as nuqls
-from tqdm import tqdm
 import numpy as np
 import models as model
 from torch import nn
 from torch.utils.data import DataLoader
 from laplace import Laplace
 import os
+import posteriors.util as pu
 import posteriors.swag as swag
+import posteriors.nuqls as nuqls
 from posteriors.lla.likelihoods import Categorical
+import utils.metrics as metrics
 import time
 import datetime
-from torchmetrics.classification import MulticlassCalibrationError, MulticlassAUROC
+from torchmetrics.classification import MulticlassCalibrationError
 import argparse
 import warnings
+
+import utils.training
 
 warnings.filterwarnings('ignore') 
 
@@ -147,8 +149,8 @@ elif args.dataset=='cifar':
     n_channels = 3
 
 if args.subsample:
-    N_TRAIN = 1000
-    N_TEST = 100
+    N_TRAIN = 100
+    N_TEST = 10
     training_data = torch.utils.data.Subset(training_data,range(N_TRAIN))
     test_data = torch.utils.data.Subset(test_data,range(N_TEST))
     val_data = torch.utils.data.Subset(val_data,range(N_TEST))
@@ -226,7 +228,7 @@ for ei in tqdm(range(args.n_experiment)):
                 map_net = model.WRN(depth=28, widening_factor=5, num_classes = n_output).to(device)
             elif args.model == 'resnet50':
                 map_net = model.ResNet50(in_channels=n_channels, num_classes = n_output).to(device)
-            map_net.apply(df2.init_weights)
+            map_net.apply(utils.training.init_weights)
             map_net.eval()
             num_weights = sum(p.numel() for p in map_net.parameters() if p.requires_grad)
             print(f"num weights = {num_weights}")
@@ -242,15 +244,15 @@ for ei in tqdm(range(args.n_experiment)):
                 optimizer = torch.optim.Adam(map_net.parameters(), lr=learning_rate, weight_decay=weight_decay)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
 
-            train_loss, train_acc, _, _ = df2.training(train_loader=train_dataloader,test_loader=test_dataloader,
+            train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader,test_loader=test_dataloader,
                                                                         model=map_net, loss_fn=loss_fn, optimizer=optimizer,
                                                                         scheduler=scheduler,epochs=epochs,
                                                                         verbose=args.verbose, progress_bar=args.progress)
             train_res[m]['nll'].append(train_loss)
             train_res[m]['acc'].append(train_acc)
 
-            id_mean = df2.test_sampler(map_net, test_data, bs=batch_size, probit=True)
-            ood_mean = df2.test_sampler(map_net, ood_test_data, bs=batch_size, probit=True)
+            id_mean = pu.test_sampler(map_net, test_data, bs=batch_size, probit=True)
+            ood_mean = pu.test_sampler(map_net, ood_test_data, bs=batch_size, probit=True)
 
         elif m == 'NUQLs':
             S = args.nuqls_S
@@ -269,7 +271,7 @@ for ei in tqdm(range(args.n_experiment)):
             print(res['loss'])
             print(res['acc'])
 
-            train_res[m]['nll'].append(res['loss'])
+            train_res[m]['nll'].append(res['loss'].detach().cpu().item())
             train_res[m]['acc'].append(res['acc'])
 
             id_mean = nuqls_predictions.softmax(dim=2).mean(dim=0)
@@ -292,7 +294,7 @@ for ei in tqdm(range(args.n_experiment)):
                     model_list.append(model.WRN(depth=28, widening_factor=5, num_classes = n_output).to(device))
                 elif args.model == 'resnet50':
                     model_list.append(model.ResNet50(in_channels=n_channels, num_classes = n_output).to(device))
-                model_list[i].apply(df2.init_weights)
+                model_list[i].apply(utils.training.init_weights)
                 if args.model == 'resnet50':
                     opt_list.append(torch.optim.SGD(model_list[i].parameters(), lr = learning_rate, momentum=0.9, weight_decay = weight_decay))
                 else:
@@ -305,7 +307,7 @@ for ei in tqdm(range(args.n_experiment)):
             de_train_loss = 0
             de_train_acc = 0
             for i in range(M):
-                train_loss, train_acc, _, _ = df2.training(train_loader=train_dataloader, test_loader=test_dataloader,
+                train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader, test_loader=test_dataloader,
                                                                             model=model_list[i],loss_fn=loss_fn,optimizer=opt_list[i],
                                                                             scheduler=sched_list[i],epochs=epochs,verbose=args.verbose, progress_bar=args.progress)
                 de_train_loss += train_loss
@@ -318,10 +320,10 @@ for ei in tqdm(range(args.n_experiment)):
             
             ### Deep ensembles inference
 
-            id_mean, id_var, id_predictions = df2.ensemble_sampler(dataset=test_data,M=M,      # id_predictions -> S x N x C
+            id_mean, id_var, id_predictions = pu.ensemble_sampler(dataset=test_data,M=M,      # id_predictions -> S x N x C
                                                     models=model_list,n_output=n_output,
                                                     bs=batch_size)
-            ood_mean, ood_var, ood_predictions = df2.ensemble_sampler(dataset=ood_test_data,M=M,    # ood_predictions -> : S x N x C
+            ood_mean, ood_var, ood_predictions = pu.ensemble_sampler(dataset=ood_test_data,M=M,    # ood_predictions -> : S x N x C
                                                     models=model_list,n_output=n_output,
                                                     bs=batch_size)
     
@@ -332,7 +334,7 @@ for ei in tqdm(range(args.n_experiment)):
             for i in range(M):
                 if S > 10:
                     nuqls_linear_method = nuqls.linear_nuqls_c(net = model_list[i], train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
-                                                            bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_scale)
+                                                            bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_gamma)
                     nuqls_predictions, ood_nuqls_predictions, res = nuqls_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
                                                                                         weight_decay=args.nuqls_wd, verbose=args.verbose, 
                                                                                         progress_bar=args.progress, gradnorm=True) # S x N x C
@@ -340,12 +342,12 @@ for ei in tqdm(range(args.n_experiment)):
                 else:
                     nuqls_predictions, ood_nuqls_predictions, res = nuqls.linear_sampling(net = model_list[i], train_data = training_data, test_data = test_data, 
                                                                                 ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
-                                                                                S = S, scale=args.nuqls_scale, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
+                                                                                S = S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
                                                                                 wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C
                 print(res['loss'])
                 print(res['acc'])
 
-                train_res[m]['nll'].append(res['loss'])
+                train_res[m]['nll'].append(res['loss'].detach().cpu().item())
                 train_res[m]['acc'].append(res['acc'])
 
                 id_predictions = nuqls_predictions.softmax(dim=2)
@@ -388,22 +390,22 @@ for ei in tqdm(range(args.n_experiment)):
             )
 
             T = 1000
-            id_mean, id_var, id_predictions = df2.lla_sampler(dataset=test_data, 
+            id_mean, id_var, id_predictions = pu.lla_sampler(dataset=test_data, 
                                                               model = lambda x : la.predictive_samples(x=x,pred_type='glm',n_samples=T), 
                                                               bs = batch_size)  # id_predictions -> S x N x C
 
-            ood_mean, ood_var, ood_predictions = df2.lla_sampler(dataset=ood_test_data, 
+            ood_mean, ood_var, ood_predictions = pu.lla_sampler(dataset=ood_test_data, 
                                                                     model = lambda x : la.predictive_samples(x=x,pred_type='glm',n_samples=T), 
                                                                     bs = batch_size)  # ood_predictions -> S x N x C
 
         elif m == 'SWAG':
             swag_net = swag.SWAG(map_net,epochs = epochs,lr = learning_rate*1e2, cov_mat = True,
                                 max_num_models=M)
-            swag_net.train_swag(train_dataloader,args.progress)
+            swag_net.train_swag(train_dataloader=train_dataloader,progress_bar=args.progress)
 
             T = 100
-            id_mean, id_var, id_predictions = df2.swag_sampler(dataset=test_data,model=swag_net,T=T,n_output=n_output,bs=batch_size) # id_predictions -> S x N x C
-            ood_mean, ood_var, ood_predictions = df2.swag_sampler(dataset=ood_test_data,model=swag_net,T=T,n_output=n_output,bs=batch_size) # ood_predictions -> S x N x C
+            id_mean, id_var, id_predictions = pu.swag_sampler(dataset=test_data,model=swag_net,T=T,n_output=n_output,bs=batch_size) # id_predictions -> S x N x C
+            ood_mean, ood_var, ood_predictions = pu.swag_sampler(dataset=ood_test_data,model=swag_net,T=T,n_output=n_output,bs=batch_size) # ood_predictions -> S x N x C
         
         elif m == 'MC-Dropout':
             p = 0.25
@@ -416,7 +418,7 @@ for ei in tqdm(range(args.n_experiment)):
                 mc_net = model.WRN(depth=28, widening_factor=5, num_classes = n_output, drop_rate=p).to(device)
             elif args.model == 'resnet50':
                 mc_net = model.ResNet50(in_channels=n_channels, num_classes = n_output, p = p).to(device)
-            mc_net.apply(df2.init_weights)
+            mc_net.apply(utils.training.init_weights)
             mc_net.eval()
             num_weights = sum(p.numel() for p in mc_net.parameters() if p.requires_grad)
 
@@ -429,7 +431,7 @@ for ei in tqdm(range(args.n_experiment)):
             else:
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
 
-            train_loss, train_acc, _, _ = df2.training(train_loader=train_dataloader,test_loader=test_dataloader,
+            train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader,test_loader=test_dataloader,
                                                                         model=mc_net, loss_fn=loss_fn, optimizer=optimizer,
                                                                         scheduler=scheduler,epochs=epochs,
                                                                         verbose=False, train_mode=False, progress_bar=args.progress)
@@ -437,8 +439,8 @@ for ei in tqdm(range(args.n_experiment)):
             train_res[m]['acc'].append(train_acc)
             
             T = 100
-            id_mean, id_var, id_predictions = df2.dropout_sampler(dataset=test_data,model=mc_net,T=T,n_output=n_output,bs=batch_size) # id_predictions -> S x N x C
-            ood_mean, ood_var, ood_predictions = df2.dropout_sampler(dataset=ood_test_data,model=mc_net,T=T,n_output=n_output,bs=batch_size) # ood_predictions -> S x N x C
+            id_mean, id_var, id_predictions = pu.dropout_sampler(dataset=test_data,model=mc_net,T=T,n_output=n_output,bs=batch_size) # id_predictions -> S x N x C
+            ood_mean, ood_var, ood_predictions = pu.dropout_sampler(dataset=ood_test_data,model=mc_net,T=T,n_output=n_output,bs=batch_size) # ood_predictions -> S x N x C
 
         t2 = time.time()
         test_res[m]['time'].append(t2-t1)
@@ -448,7 +450,7 @@ for ei in tqdm(range(args.n_experiment)):
         test_res[m]['acc'].append((id_mean.argmax(1).to(device) == test_y.to(device)).type(torch.float).mean().item())
         test_res[m]['ece'].append(metric(id_mean.to(device),test_y.to(device)).cpu().item())
 
-        oodauc, aucroc = df2.auc_metric(id_mean, ood_mean, logits=False)
+        oodauc, aucroc = metrics.auc_metric(id_mean, ood_mean, logits=False)
         test_res[m]['oodauc'].append(oodauc)
         test_res[m]['aucroc'].append(aucroc)
 
@@ -467,21 +469,21 @@ for ei in tqdm(range(args.n_experiment)):
             # Save predictions
             prediction_dict[m] = {'id': id_predictions,
                                     'ood': ood_predictions}
-            id_correct, id_incorrect = df2.sort_preds(id_predictions.to(device),torch.tensor(test_data.targets).to(device))
+            if args.subsample:
+                _,targets = next(iter(DataLoader(test_data,len(test_data))))
+            else:
+                targets = torch.tensor(test_data.targets)
+            id_correct, id_incorrect = metrics.sort_preds(id_predictions.to(device),targets.to(device))
 
             prob_var_dict[m] = {'id_correct': id_correct.var(0),
                                 'id_incorrect': id_incorrect.var(0),
                                     'ood': ood_predictions.var(0)}
             
 
-    # Save variances for testing
+    # Save predictions, variances for plotting
     if args.save_var:
         torch.save(prob_var_dict,res_dir + f"prob_var_dict_{ei}.pt")
         torch.save(prediction_dict,res_dir + f"prediction_dict_{ei}.pt")
-
-    res_violin_v = res_dir + f"vv_{ei}.pdf"
-
-    df2.violin_var(var_dict=prob_var_dict, probit_sum = True, show=False, save_file=res_violin_v, title='Probit Variance', text = False)
 
 ## Record results
 res_text = res_dir + f"result.txt"
@@ -489,16 +491,13 @@ results = open(res_text,'w')
 torch.save(train_res,res_dir + f'train_res.pt')
 torch.save(test_res,res_dir + f'test_res.pt')
 
-print(f'train_res = {train_res}')
-print(f'test_res = {test_res}')
-
 percentage_metrics = ['acc','ece','oodauc','aucroc']
 
 results.write(" --- MAP Training Details --- \n")
 results.write(f"epochs: {epochs}; M: {M}; lr: {learning_rate}; weight_decay: {weight_decay}\n")
 
 results.write("\n --- NUQLS Details --- \n")
-results.write(f"epochs: {args.nuqls_epoch}; S: {M}; lr: {args.nuqls_lr}; weight_decay: {args.nuqls_wd}; init scale: {args.nuqls_scale}\n")
+results.write(f"epochs: {args.nuqls_epoch}; S: {M}; lr: {args.nuqls_lr}; weight_decay: {args.nuqls_wd}; init scale: {args.nuqls_gamma}\n")
 
 for m in methods:
     if args.n_experiment > 1:

@@ -1,8 +1,8 @@
 import torch
 from torch.optim import Adam
 
-from lla.models import SiBayesianMLP
-from lla.likelihoods import BernoulliLh, GaussianLh
+from posteriors.lla.models import SiBayesianMLP
+from posteriors.lla.likelihoods import BernoulliLh, GaussianLh
 
 
 def preds_bbb(model, X, n_samples, likelihood):

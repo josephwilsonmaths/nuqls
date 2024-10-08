@@ -1,5 +1,5 @@
 import torch
-from lla.gradients import Jacobians
+from posteriors.lla.gradients import Jacobians
 from torch.nn.utils import parameters_to_vector
 from torch.optim import Adam
 from torch.distributions import MultivariateNormal, Normal, kl_divergence
