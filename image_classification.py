@@ -183,8 +183,8 @@ if args.lla_incl:
     methods = ['MAP','LLA-LL-KFAC']
     train_methods = ['MAP']
 else:
-    methods = ['MAP','NUQLs','DE','eNUQLs','SWAG','MC-Dropout']
-    train_methods = ['MAP','NUQLs','DE','eNUQLs','MC-Dropout']
+    methods = ['MAP','NUQLs','DE','SWAG','MC-Dropout']
+    train_methods = ['MAP','NUQLs','DE','MC-Dropout']
 test_res = {}
 train_res = {}
 for m in methods:
@@ -257,14 +257,14 @@ for ei in tqdm(range(args.n_experiment)):
         elif m == 'NUQLs':
             S = args.nuqls_S
             if S > 10:
-                nuqls_linear_method = nuqls.linear_nuqls_c(net = map_net, train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
+                nuqls_method = nuqls.classification_parallel(net = map_net, train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
                                                         bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_gamma)
-                nuqls_predictions, ood_nuqls_predictions, res = nuqls_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
+                nuqls_predictions, ood_nuqls_predictions, res = nuqls_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
                                                                                     weight_decay=args.nuqls_wd, verbose=args.verbose, progress_bar=args.progress, gradnorm=True, 
                                                                                     ) # S x N x C
-                del nuqls_linear_method
+                del nuqls_method
             else:
-                nuqls_predictions, ood_nuqls_predictions, res = nuqls.linear_sampling(net = map_net, train_data = training_data, test_data = test_data, 
+                nuqls_predictions, ood_nuqls_predictions, res = nuqls.series_method(net = map_net, train_data = training_data, test_data = test_data, 
                                                                             ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
                                                                             S = S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
                                                                             wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C
@@ -280,6 +280,8 @@ for ei in tqdm(range(args.n_experiment)):
             ood_var = ood_nuqls_predictions.softmax(dim=2).var(dim=0)
             id_predictions = nuqls_predictions.softmax(dim=2)
             ood_predictions = ood_nuqls_predictions.softmax(dim=2)
+
+            
 
         elif m == 'DE':
             model_list = []
@@ -333,14 +335,14 @@ for ei in tqdm(range(args.n_experiment)):
             ood_preds = []
             for i in range(M):
                 if S > 10:
-                    nuqls_linear_method = nuqls.linear_nuqls_c(net = model_list[i], train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
+                    nuqls_method = nuqls.classification_parallel(net = model_list[i], train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
                                                             bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_gamma)
-                    nuqls_predictions, ood_nuqls_predictions, res = nuqls_linear_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
+                    nuqls_predictions, ood_nuqls_predictions, res = nuqls_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
                                                                                         weight_decay=args.nuqls_wd, verbose=args.verbose, 
                                                                                         progress_bar=args.progress, gradnorm=True) # S x N x C
-                    del nuqls_linear_method
+                    del nuqls_method
                 else:
-                    nuqls_predictions, ood_nuqls_predictions, res = nuqls.linear_sampling(net = model_list[i], train_data = training_data, test_data = test_data, 
+                    nuqls_predictions, ood_nuqls_predictions, res = nuqls.series_method(net = model_list[i], train_data = training_data, test_data = test_data, 
                                                                                 ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
                                                                                 S = S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
                                                                                 wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C

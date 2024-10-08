@@ -1,0 +1,15 @@
+backpack_for_pytorch
+deepobs
+gpytorch
+numpy
+opt_einsum
+pandas
+scikit_learn
+scipy
+torch
+torchmetrics
+torchvision
+tqdm
+laplace-torch
+tensorflow
+openpyxl

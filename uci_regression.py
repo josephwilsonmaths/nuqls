@@ -308,7 +308,7 @@ for ei in tqdm(range(args.n_experiment)):
             scales = torch.linspace(0,1,20)
 
             for s,scale in enumerate(scales):
-                nuqls_model = nuqls.linear_nuqls_small(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=scale)
+                nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=scale)
                 new_nuqls_predictions,_,_ = nuqls_model.method(validation_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
                 new_observed_conf_nuqls, new_predicted_conf = calibration_curve_r(calibration_test_loader_val,new_nuqls_predictions.mean(1),new_nuqls_predictions.var(1),11)
                 new_ece_nuqls = torch.mean(torch.square(new_observed_conf_nuqls - new_predicted_conf))
@@ -321,7 +321,7 @@ for ei in tqdm(range(args.n_experiment)):
                 else:
                     break
 
-            nuqls_model = nuqls.linear_nuqls_small(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=best_scale)
+            nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=best_scale)
             nuqls_predictions, max_l2_loss, norm_resid = nuqls_model.method(test_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
 
             mean_pred = nuqls_predictions.mean(1)

@@ -1,0 +1,71 @@
+ --- MAP Training Details --- 
+epochs: 1; M: 10; lr: 0.005; weight_decay: 0.0001
+
+ --- NUQLS Details --- 
+epochs: 1; S: 10; lr: 0.1; weight_decay: 0; init scale: 1
+
+--- Method MAP ---
+
+ - Train Results: - 
+nll: 2.547 +- 0.147 
+acc: 10.8% +- 1.6% 
+
+ - Test Prediction: - 
+nll: 2.339 +- 0.071 
+acc: 16.0% +- 8.0% 
+ece: 7.7% +- 6.5% 
+oodauc: 59.2% +- 23.7% 
+aucroc: 59.0% +- 22.9% 
+time: 00:00:00
+
+--- Method NUQLs ---
+
+ - Train Results: - 
+nll: 10.739 +- 2.834 
+acc: 8.4% +- 1.7% 
+
+ - Test Prediction: - 
+nll: 4.024 +- 1.666 
+acc: 12.0% +- 4.0% 
+ece: 17.7% +- 2.9% 
+oodauc: 63.0% +- 15.4% 
+aucroc: 55.0% +- 10.7% 
+time: 00:00:00
+
+--- Method DE ---
+
+ - Train Results: - 
+nll: 2.514 +- 0.027 
+acc: 10.2% +- 0.8% 
+
+ - Test Prediction: - 
+nll: 2.355 +- 0.016 
+acc: 16.0% +- 8.0% 
+ece: 7.2% +- 4.0% 
+oodauc: 48.4% +- 11.0% 
+aucroc: 55.0% +- 14.4% 
+time: 00:00:00
+
+--- Method SWAG ---
+
+ - Test Prediction: - 
+nll: 2.399 +- 0.043 
+acc: 16.0% +- 8.0% 
+ece: 5.7% +- 6.4% 
+oodauc: 54.6% +- 22.3% 
+aucroc: 44.6% +- 21.9% 
+time: 00:00:00
+
+--- Method MC-Dropout ---
+
+ - Train Results: - 
+nll: 2.511 +- 0.108 
+acc: 8.8% +- 2.3% 
+
+ - Test Prediction: - 
+nll: 2.391 +- 0.065 
+acc: 10.0% +- 6.3% 
+ece: 8.5% +- 4.5% 
+oodauc: 47.4% +- 20.5% 
+aucroc: 55.4% +- 15.2% 
+time: 00:00:00

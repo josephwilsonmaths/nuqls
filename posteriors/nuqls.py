@@ -17,7 +17,7 @@ device = (
 )
 
 ## Keep this one
-class linear_nuqls_c(object):
+class classification_parallel(object):
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,n_output,init_scale=1):
         self.net = net
         self.train = train
@@ -51,17 +51,16 @@ class linear_nuqls_c(object):
             return J
         
         ## Train S realisations of linearised networks
-        loss = 0
-        accuracy = 0
-        if gradnorm:
-            total_grad = 0
-
         if progress_bar:
             pbar = tqdm.trange(self.epochs)
         else:
             pbar = range(self.epochs)
         
         for epoch in pbar:
+            loss = torch.zeros(self.S)
+            accuracy = 0
+            if gradnorm:
+                total_grad = 0
             for x,y in train_loader:
                 x, y = x.to(device), y.to(device)
                 J = jacobian(x).detach()
@@ -73,6 +72,8 @@ class linear_nuqls_c(object):
                     ybar = torch.nn.functional.one_hot(y,num_classes=self.n_output).flatten(0,1)
                     grad = (J.flatten(0,1).T @ (Mubar - ybar.unsqueeze(1)) / x.shape[0])
 
+                    loss += 1 / x.shape[0] * torch.sum((ybar.unsqueeze(1) * torch.log(Mubar)),dim=0)
+
                     if epoch == 0:
                         bt = grad
                     else:
@@ -80,13 +81,16 @@ class linear_nuqls_c(object):
 
                     self.theta -= self.lr * bt
 
-                    loss += self.loss_fn(f_lin[:,:,-1],y).detach().item()
+                    # loss += self.loss_fn(f_lin[:,:,-1],y).detach().item()
+                    # print(loss)
+                    # import sys; sys.exit(0)
                     # print("batch loss = {}".format(self.loss_fn(f_lin[:,:,14],y)))
                     accuracy += (f_lin[:,:,-1].argmax(1) == y).type(torch.float).mean().item()
                     if gradnorm:
                         total_grad += grad.detach()
 
             loss /= len(train_loader)
+            loss = torch.max(loss)
             accuracy /= len(train_loader)
             if gradnorm:
                 total_grad /= len(train_loader)
@@ -134,7 +138,7 @@ class linear_nuqls_c(object):
 
     
 ## Keep this one
-class linear_nuqls_small(object):
+class small_regression_parallel(object):
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,init_scale=1):
         self.net = net
         self.train = train
@@ -236,7 +240,7 @@ def unflatten_like(vector, likeTensorList):
     return tuple(outList)
 
 ## Keep this one.
-def linear_sampling(net, train_data, test_data, ood_test_data=None, regression = False, train_bs = 100, test_bs = 100, S = 10, scale=1, lr=1e-3, epochs=20, mu=0.9, wd = 0, verbose=False, progress_bar = True):
+def series_method(net, train_data, test_data, ood_test_data=None, regression = False, train_bs = 100, test_bs = 100, S = 10, scale=1, lr=1e-3, epochs=20, mu=0.9, wd = 0, verbose=False, progress_bar = True):
     # Create functional version of net
     fnet, params, buffers = make_functional_with_buffers(net)
 
