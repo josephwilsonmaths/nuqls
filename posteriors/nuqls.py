@@ -16,7 +16,6 @@ device = (
     else "cpu"
 )
 
-## Keep this one
 class classification_parallel(object):
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,n_output,init_scale=1):
         self.net = net
@@ -58,7 +57,8 @@ class classification_parallel(object):
         
         for epoch in pbar:
             loss = torch.zeros(self.S)
-            accuracy = 0
+            loss2 = 0
+            accuracy = torch.zeros(self.S)
             if gradnorm:
                 total_grad = 0
             for x,y in train_loader:
@@ -72,7 +72,7 @@ class classification_parallel(object):
                     ybar = torch.nn.functional.one_hot(y,num_classes=self.n_output).flatten(0,1)
                     grad = (J.flatten(0,1).T @ (Mubar - ybar.unsqueeze(1)) / x.shape[0])
 
-                    loss += 1 / x.shape[0] * torch.sum((ybar.unsqueeze(1) * torch.log(Mubar)),dim=0)
+                    loss -= 1 / x.shape[0] * torch.sum((ybar.unsqueeze(1) * torch.log(Mubar)),dim=0)
 
                     if epoch == 0:
                         bt = grad
@@ -81,17 +81,14 @@ class classification_parallel(object):
 
                     self.theta -= self.lr * bt
 
-                    # loss += self.loss_fn(f_lin[:,:,-1],y).detach().item()
-                    # print(loss)
-                    # import sys; sys.exit(0)
-                    # print("batch loss = {}".format(self.loss_fn(f_lin[:,:,14],y)))
-                    accuracy += (f_lin[:,:,-1].argmax(1) == y).type(torch.float).mean().item()
+                    accuracy += (f_lin.argmax(1) == y.unsqueeze(1)).type(torch.float).mean(dim=0)
                     if gradnorm:
                         total_grad += grad.detach()
 
             loss /= len(train_loader)
             loss = torch.max(loss)
             accuracy /= len(train_loader)
+            accuracy = torch.min(accuracy)
             if gradnorm:
                 total_grad /= len(train_loader)
 
@@ -137,7 +134,6 @@ class classification_parallel(object):
         return id_predictions, res
 
     
-## Keep this one
 class small_regression_parallel(object):
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,init_scale=1):
         self.net = net
@@ -239,7 +235,6 @@ def unflatten_like(vector, likeTensorList):
         i += n
     return tuple(outList)
 
-## Keep this one.
 def series_method(net, train_data, test_data, ood_test_data=None, regression = False, train_bs = 100, test_bs = 100, S = 10, scale=1, lr=1e-3, epochs=20, mu=0.9, wd = 0, verbose=False, progress_bar = True):
     # Create functional version of net
     fnet, params, buffers = make_functional_with_buffers(net)
@@ -293,7 +288,7 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
         else:
             loss_fn = torch.nn.MSELoss()
 
-        for epoch in tqdm.trange(epochs):
+        for epoch in range(epochs):
             loss_e = 0
             acc_e = 0
             for x,y in train_loader:
@@ -306,8 +301,6 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
                 if not regression:
                     acc_e += (pred.argmax(1) == y).type(torch.float).sum().item()
                 optim.step()
-                # print(f"loss: {loss:.4}")
-                # print(f"magnitude of grad: {torch.linalg.norm(flatten(theta_star))}")
             
             loss_e /= len(train_loader)
             if not regression:

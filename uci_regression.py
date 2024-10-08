@@ -344,8 +344,8 @@ for ei in tqdm(range(args.n_experiment)):
             de_test_total = 0
             de_mse_total = 0
             de_t1 = time.time()
-            for i in range(M):
-                for epoch in tqdm(range(de_epochs)):
+            for i in tqdm(range(M)):
+                for epoch in range(de_epochs):
                     de_train_loss = train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=None)
                     de_test_loss, de_test_mse = test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
                 de_train_total += de_train_loss

@@ -2,7 +2,7 @@ import torch
 import torchvision.transforms as transforms
 from torchvision.transforms import ToTensor
 from torchvision import datasets
-from tqdm import tqdm
+import tqdm
 import numpy as np
 import models as model
 from torch import nn
@@ -214,7 +214,7 @@ else:
 if not os.path.exists(res_dir):
     os.makedirs(res_dir)
 
-for ei in tqdm(range(args.n_experiment)):
+for ei in tqdm.trange(args.n_experiment):
     print("\n--- experiment {} ---".format(ei))
 
     for m in methods:
@@ -268,8 +268,6 @@ for ei in tqdm(range(args.n_experiment)):
                                                                             ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
                                                                             S = S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
                                                                             wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C
-            print(res['loss'])
-            print(res['acc'])
 
             train_res[m]['nll'].append(res['loss'].detach().cpu().item())
             train_res[m]['acc'].append(res['acc'])
@@ -308,10 +306,16 @@ for ei in tqdm(range(args.n_experiment)):
 
             de_train_loss = 0
             de_train_acc = 0
-            for i in range(M):
+
+            if args.progress:
+                pbar = tqdm.trange(M)
+            else:
+                pbar = range(M)
+
+            for i in pbar:
                 train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader, test_loader=test_dataloader,
                                                                             model=model_list[i],loss_fn=loss_fn,optimizer=opt_list[i],
-                                                                            scheduler=sched_list[i],epochs=epochs,verbose=args.verbose, progress_bar=args.progress)
+                                                                            scheduler=sched_list[i],epochs=epochs,verbose=args.verbose, progress_bar=False)
                 de_train_loss += train_loss
                 de_train_acc += train_acc
             de_train_loss /= M
@@ -465,7 +469,7 @@ for ei in tqdm(range(args.n_experiment)):
         t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
         print(f"Time h:m:s: {t}")
         print(f"Acc.: {test_res[m]['acc'][ei]:.1%}; ECE: {test_res[m]['ece'][ei]:.1%}; NLL: {test_res[m]['nll'][ei]:.3}")
-        print(f"OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%}")
+        print(f"OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%}\n")
 
         if m != 'MAP':
             # Save predictions
