@@ -65,7 +65,7 @@ print("Number of data points = {}".format(len(df)))
 print("Number of coloumns = {}".format(len(df.columns)))
 print("Number of features = {}".format(input_dim))
 
-## Calibration function
+## Calibration function (ECE)
 def calibration_curve_r(loader,mean,variance,c):
     predicted_conf = torch.linspace(0,1,c)
     observed_conf = torch.empty((c))
@@ -241,6 +241,7 @@ validation_size = int(num_points*((1-train_ratio)/2))
 test_size = int(num_points - train_size - validation_size)
 dataset_numpy = df.values
 
+# Normalize the dataset
 if normalize:
     mx = dataset_numpy[:,:input_dim].mean(0)
     my = dataset_numpy[:,input_dim].mean(0)
@@ -248,13 +249,12 @@ if normalize:
     sy = dataset_numpy[:,input_dim].std(0)
 
 # Training parameters
-
 lr = 1e-3
 weight_decay = 1e-5
 batch_size = 100
 mse_loss = nn.MSELoss(reduction='mean')
 nll = torch.nn.GaussianNLLLoss()
-M = 10
+S = 10
 
 # Setup metrics
 methods = ['MAP','NUQLs','DE','LLA']
@@ -272,7 +272,7 @@ for m in methods:
 
 for ei in tqdm(range(args.n_experiment)):
     print("\n--- experiment {} ---".format(ei))
-    np.random.shuffle(dataset_numpy)
+    np.random.shuffle(dataset_numpy) # Randomness
     training_set, validation_set, test_set = dataset_numpy[:train_size,:], dataset_numpy[train_size:train_size+validation_size], dataset_numpy[train_size+validation_size:,:]
 
     train_dataset = RegressionDataset(training_set, input_dim=input_dim, mX=mx, sX=sx, my=my, sy=sy)
@@ -295,7 +295,6 @@ for ei in tqdm(range(args.n_experiment)):
             adam_optimizer = torch.optim.Adam(map_net.parameters(), lr=lr, weight_decay=weight_decay)
             scheduler = torch.optim.lr_scheduler.PolynomialLR(adam_optimizer, total_iters=epochs*10, power=0.5)
 
-            map_t1 = time.time()
             # Run the training loop
             for epoch in tqdm(range(epochs)):
                 map_train_loss  = train(train_loader, map_net, optimizer=adam_optimizer, loss_function=mse_loss, scheduler=scheduler)
@@ -334,7 +333,7 @@ for ei in tqdm(range(args.n_experiment)):
             opt_list = []
             sched_list = []
 
-            for i in range(M):
+            for i in range(S):
                 model_list.append(EnsembleNetwork().to(device=device,dtype=torch.float64))
                 model_list[i].apply(weights_init)
                 opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = lr, weight_decay = weight_decay))
@@ -344,22 +343,22 @@ for ei in tqdm(range(args.n_experiment)):
             de_test_total = 0
             de_mse_total = 0
             de_t1 = time.time()
-            for i in tqdm(range(M)):
+            for i in tqdm(range(S)):
                 for epoch in range(de_epochs):
                     de_train_loss = train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=None)
                     de_test_loss, de_test_mse = test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
                 de_train_total += de_train_loss
                 de_test_total += de_test_loss
                 de_mse_total += de_test_mse
-            de_train_total /= M
-            de_test_total /= M
-            de_mse_total /= M
+            de_train_total /= S
+            de_test_total /= S
+            de_mse_total /= S
 
             train_res['DE']['loss'].append(de_train_total)
 
-            ensemble_het_mu = torch.empty((M,test_size))
-            ensemble_het_var = torch.empty((M,test_size))
-            for i in range(M):
+            ensemble_het_mu = torch.empty((S,test_size))
+            ensemble_het_var = torch.empty((S,test_size))
+            for i in range(S):
                 for X,y in test_loader:
                     X,y = X.to(device), y.to(device)
                     y = y.reshape((y.shape[0],1))
@@ -462,7 +461,7 @@ results.write("training: epochs, de_epochs, lr, weight decay, batch size = {}, {
 ))
 
 results.write("\n --- NUQLs Details --- \n")
-results.write(f"epochs: {args.nuqls_epoch}; S: {M}; lr: {args.nuqls_lr}; epochs: {args.nuqls_epoch}\n")
+results.write(f"epochs: {args.nuqls_epoch}; S: {args.nuqls_S}; lr: {args.nuqls_lr}; epochs: {args.nuqls_epoch}\n")
 
 for m in methods:
     if args.n_experiment > 1:

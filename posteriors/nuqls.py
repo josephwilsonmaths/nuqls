@@ -17,6 +17,9 @@ device = (
 )
 
 class classification_parallel(object):
+    '''
+    NUQLS implementation for: classification, larger S. Per epoch training is much slower compared to serial implement, but overall is faster. Use for S > 10.
+    '''
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,n_output,init_scale=1):
         self.net = net
         self.train = train
@@ -86,9 +89,9 @@ class classification_parallel(object):
                         total_grad += grad.detach()
 
             loss /= len(train_loader)
-            loss = torch.max(loss)
+            loss = torch.max(loss) # Report maximum CE loss over realisations.
             accuracy /= len(train_loader)
-            accuracy = torch.min(accuracy)
+            accuracy = torch.min(accuracy) # Report minimum CE loss over realisations.
             if gradnorm:
                 total_grad /= len(train_loader)
 
@@ -105,6 +108,7 @@ class classification_parallel(object):
         if gradnorm:
             res['grad'] = torch.max(torch.linalg.norm(total_grad,dim=0))
         
+        # Concatenate predictions
         pred_s = []
         for x,y in test_loader:
             x, y = x.to(device), y.to(device)
@@ -135,6 +139,9 @@ class classification_parallel(object):
 
     
 class small_regression_parallel(object):
+    '''
+    NUQLS implementation for: regression, larger S, tiny dataset size. Per epoch training is much slower compared to serial implement, but overall is faster. Use for S > 10.
+    '''
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,init_scale=1):
         self.net = net
         self.train = train
@@ -191,9 +198,11 @@ class small_regression_parallel(object):
                 print("max l2 loss = {}".format(torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y.unsqueeze(1))).max()))
                 print("Residual of normal equation l2 = {}".format(torch.mean(torch.square(J.T @ ( f_nlin + J @ (self.theta - self.theta_t.unsqueeze(1)) - Y.unsqueeze(1))))))
 
+        # Report maximum loss over S, and the mean gradient norm
         max_l2_loss = torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y.unsqueeze(1))).max()
         norm_resid = torch.mean(torch.square(J.T @ ( f_nlin + J @ (self.theta - self.theta_t.unsqueeze(1)) - Y.unsqueeze(1))))
                 
+        # Concatenate predictions
         pred_s = []
         for x,y in test_loader:
             x, y = x.to(device), y.to(device)
@@ -207,35 +216,12 @@ class small_regression_parallel(object):
 
         predictions = torch.cat(pred_s,dim=1)
         return predictions, max_l2_loss, norm_resid
- 
-def linearize(f, params):
-  def f_lin(p, *args, **kwargs):
-    dparams = _sub(p, params)
-    f_params_x, proj = jvp(lambda param: f(param, *args, **kwargs),
-                           (params,), (dparams,))
-    return f_params_x + proj
-  return f_lin
-
-def _sub(x, y):
-  return tuple(x - y for (x, y) in zip(x, y))
-
-def flatten(lst):
-    tmp = [i.contiguous().view(-1, 1) for i in lst]
-    return torch.cat(tmp).view(-1)
-
-def unflatten_like(vector, likeTensorList):
-    # Takes a flat torch.tensor and unflattens it to a list of torch.tensors
-    #    shaped like likeTensorList
-    outList = []
-    i = 0
-    for tensor in likeTensorList:
-        # n = module._parameters[name].numel()
-        n = tensor.numel()
-        outList.append(vector[i : i + n].view(tensor.shape))
-        i += n
-    return tuple(outList)
 
 def series_method(net, train_data, test_data, ood_test_data=None, regression = False, train_bs = 100, test_bs = 100, S = 10, scale=1, lr=1e-3, epochs=20, mu=0.9, wd = 0, verbose=False, progress_bar = True):
+    '''
+    NUQLS implementation for: either regression/classification, small S. 
+    Per epoch training is much faster compared to parallel implement, overall speed is faster when S <= 10.
+    '''
     # Create functional version of net
     fnet, params, buffers = make_functional_with_buffers(net)
 
@@ -322,6 +308,7 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
         if acc_e < res['acc']:
             res['acc'] = acc_e
 
+        # Concatenate predictions
         pred_test = []
         for x,_ in test_loader:
             x = x.to(device)
@@ -345,7 +332,30 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
       return id_predictions, ood_predictions, res
 
     return id_predictions, res
+ 
+def linearize(f, params):
+  def f_lin(p, *args, **kwargs):
+    dparams = _sub(p, params)
+    f_params_x, proj = jvp(lambda param: f(param, *args, **kwargs),
+                           (params,), (dparams,))
+    return f_params_x + proj
+  return f_lin
 
-def init_weights_he(m):
-    if type(m) == nn.Linear or type(m) == nn.Conv2d:
-        nn.init.kaiming_normal_(m.weight)
+def _sub(x, y):
+  return tuple(x - y for (x, y) in zip(x, y))
+
+def flatten(lst):
+    tmp = [i.contiguous().view(-1, 1) for i in lst]
+    return torch.cat(tmp).view(-1)
+
+def unflatten_like(vector, likeTensorList):
+    # Takes a flat torch.tensor and unflattens it to a list of torch.tensors
+    #    shaped like likeTensorList
+    outList = []
+    i = 0
+    for tensor in likeTensorList:
+        # n = module._parameters[name].numel()
+        n = tensor.numel()
+        outList.append(vector[i : i + n].view(tensor.shape))
+        i += n
+    return tuple(outList)

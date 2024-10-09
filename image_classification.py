@@ -56,7 +56,7 @@ parser.add_argument('--progress', action='store_false')
 parser.add_argument('--lla_incl', action='store_true', help='if flag is included, lla will run (bugs out with nuqls)')
 args = parser.parse_args()
 
-
+# Get dataset
 if args.dataset=='mnist':
     training_data = datasets.MNIST(
         root="data/MNIST",
@@ -143,7 +143,7 @@ elif args.dataset=='cifar':
         transform=transform_test
     ) 
 
-    # train_data, val_data = torch.utils.data.random_split(training_data,[50000,10000])
+    # train_data, val_data = torch.utils.data.random_split(training_data,[50000,10000]) -> results in performance drop for CIFAR
     val_data = test_data
     n_output = 10
     n_channels = 3
@@ -155,7 +155,6 @@ if args.subsample:
     test_data = torch.utils.data.Subset(test_data,range(N_TEST))
     val_data = torch.utils.data.Subset(val_data,range(N_TEST))
     ood_test_data = torch.utils.data.Subset(ood_test_data,range(N_TEST))
-
 
 metric = MulticlassCalibrationError(num_classes=n_output,n_bins=10,norm='l1')
 full_test_dataloader = DataLoader(test_data, len(test_data))
@@ -169,7 +168,7 @@ batch_size = args.bs
 epochs = args.epochs
 weight_decay = args.wd
 
-M = 10
+S = 10
 lla_batch_size = 50
 
 train_dataloader = DataLoader(training_data, batch_size, shuffle=True)
@@ -180,11 +179,11 @@ loss_fn = nn.CrossEntropyLoss()
 
 # Setup metrics
 if args.lla_incl:
-    methods = ['MAP','LLA-LL-KFAC']
+    methods = ['MAP','LLA']
     train_methods = ['MAP']
 else:
-    methods = ['MAP','NUQLs','DE','SWAG','MC-Dropout']
-    train_methods = ['MAP','NUQLs','DE','MC-Dropout']
+    methods = ['MAP','NUQLS','DE','SWAG','MC']
+    train_methods = ['MAP','NUQLS','DE','MC']
 test_res = {}
 train_res = {}
 for m in methods:
@@ -254,10 +253,9 @@ for ei in tqdm.trange(args.n_experiment):
             id_mean = pu.test_sampler(map_net, test_data, bs=batch_size, probit=True)
             ood_mean = pu.test_sampler(map_net, ood_test_data, bs=batch_size, probit=True)
 
-        elif m == 'NUQLs':
-            S = args.nuqls_S
-            if S > 10:
-                nuqls_method = nuqls.classification_parallel(net = map_net, train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
+        elif m == 'NUQLS':
+            if args.nuqls_S > 10:
+                nuqls_method = nuqls.classification_parallel(net = map_net, train = training_data, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
                                                         bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_gamma)
                 nuqls_predictions, ood_nuqls_predictions, res = nuqls_method.method(test_data, ood_test = ood_test_data, mu=0.9, 
                                                                                     weight_decay=args.nuqls_wd, verbose=args.verbose, progress_bar=args.progress, gradnorm=True, 
@@ -266,7 +264,7 @@ for ei in tqdm.trange(args.n_experiment):
             else:
                 nuqls_predictions, ood_nuqls_predictions, res = nuqls.series_method(net = map_net, train_data = training_data, test_data = test_data, 
                                                                             ood_test_data=ood_test_data, train_bs = args.nuqls_bs, test_bs = args.nuqls_bs, 
-                                                                            S = S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
+                                                                            S = args.nuqls_S, scale=args.nuqls_gamma, lr=args.nuqls_lr, epochs=args.nuqls_epoch, mu=0.9, 
                                                                             wd = args.nuqls_wd, verbose = False, progress_bar = True) # S x N x C
 
             train_res[m]['nll'].append(res['loss'].detach().cpu().item())
@@ -279,13 +277,12 @@ for ei in tqdm.trange(args.n_experiment):
             id_predictions = nuqls_predictions.softmax(dim=2)
             ood_predictions = ood_nuqls_predictions.softmax(dim=2)
 
-            
 
         elif m == 'DE':
             model_list = []
             opt_list = []
             sched_list = []
-            for i in range(M):
+            for i in range(S):
                 if args.model == 'lenet':
                     model_list.append(model.LeNet5().to(device))
                 elif args.model == 'resnet9':
@@ -308,9 +305,9 @@ for ei in tqdm.trange(args.n_experiment):
             de_train_acc = 0
 
             if args.progress:
-                pbar = tqdm.trange(M)
+                pbar = tqdm.trange(S)
             else:
-                pbar = range(M)
+                pbar = range(S)
 
             for i in pbar:
                 train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader, test_loader=test_dataloader,
@@ -318,26 +315,26 @@ for ei in tqdm.trange(args.n_experiment):
                                                                             scheduler=sched_list[i],epochs=epochs,verbose=args.verbose, progress_bar=False)
                 de_train_loss += train_loss
                 de_train_acc += train_acc
-            de_train_loss /= M
-            de_train_acc /= M
+            de_train_loss /= S
+            de_train_acc /= S
 
             train_res[m]['nll'].append(de_train_loss)
             train_res[m]['acc'].append(de_train_acc)
             
             ### Deep ensembles inference
 
-            id_mean, id_var, id_predictions = pu.ensemble_sampler(dataset=test_data,M=M,      # id_predictions -> S x N x C
+            id_mean, id_var, id_predictions = pu.ensemble_sampler(dataset=test_data,M=S,      # id_predictions -> S x N x C
                                                     models=model_list,n_output=n_output,
                                                     bs=batch_size)
-            ood_mean, ood_var, ood_predictions = pu.ensemble_sampler(dataset=ood_test_data,M=M,    # ood_predictions -> : S x N x C
+            ood_mean, ood_var, ood_predictions = pu.ensemble_sampler(dataset=ood_test_data,M=S,    # ood_predictions -> : S x N x C
                                                     models=model_list,n_output=n_output,
                                                     bs=batch_size)
     
-        elif m == 'eNUQLs':
+        elif m == 'eNUQLS':
             S = args.nuqls_S
             id_preds = []
             ood_preds = []
-            for i in range(M):
+            for i in range(S):
                 if S > 10:
                     nuqls_method = nuqls.classification_parallel(net = model_list[i], train = training_data, S = S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, n_output=n_output, 
                                                             bs=args.nuqls_bs, bs_test=args.nuqls_bs, init_scale=args.nuqls_gamma)
@@ -368,7 +365,7 @@ for ei in tqdm.trange(args.n_experiment):
             ood_mean = ood_predictions.mean(dim=0)
             ood_var = ood_predictions.var(dim=0)
 
-        elif m == 'LLA-LL-KFAC':
+        elif m == 'LLA':
             ## LLA definitions
             def predict(dataloader, la, link='probit'):
                 py = []
@@ -406,15 +403,15 @@ for ei in tqdm.trange(args.n_experiment):
 
         elif m == 'SWAG':
             swag_net = swag.SWAG(map_net,epochs = epochs,lr = learning_rate*1e2, cov_mat = True,
-                                max_num_models=M)
+                                max_num_models=S)
             swag_net.train_swag(train_dataloader=train_dataloader,progress_bar=args.progress)
 
             T = 100
             id_mean, id_var, id_predictions = pu.swag_sampler(dataset=test_data,model=swag_net,T=T,n_output=n_output,bs=batch_size) # id_predictions -> S x N x C
             ood_mean, ood_var, ood_predictions = pu.swag_sampler(dataset=ood_test_data,model=swag_net,T=T,n_output=n_output,bs=batch_size) # ood_predictions -> S x N x C
         
-        elif m == 'MC-Dropout':
-            p = 0.25
+        elif m == 'MC':
+            p = 0.1
 
             if args.model == 'lenet':
                 mc_net = model.LeNet5_Dropout(p=p).to(device)
@@ -500,10 +497,10 @@ torch.save(test_res,res_dir + f'test_res.pt')
 percentage_metrics = ['acc','ece','oodauc','aucroc']
 
 results.write(" --- MAP Training Details --- \n")
-results.write(f"epochs: {epochs}; M: {M}; lr: {learning_rate}; weight_decay: {weight_decay}\n")
+results.write(f"epochs: {epochs}; M: {S}; lr: {learning_rate}; weight_decay: {weight_decay}\n")
 
 results.write("\n --- NUQLS Details --- \n")
-results.write(f"epochs: {args.nuqls_epoch}; S: {M}; lr: {args.nuqls_lr}; weight_decay: {args.nuqls_wd}; init scale: {args.nuqls_gamma}\n")
+results.write(f"epochs: {args.nuqls_epoch}; S: {args.nuqls_S}; lr: {args.nuqls_lr}; weight_decay: {args.nuqls_wd}; init scale: {args.nuqls_gamma}\n")
 
 for m in methods:
     if args.n_experiment > 1:

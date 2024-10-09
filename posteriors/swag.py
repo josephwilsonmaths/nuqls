@@ -204,7 +204,9 @@ class SWAG(torch.nn.Module):
             module.__setattr__(name, torch.nn.parameter.Parameter(sample))
 
 class SWAG_R(torch.nn.Module):
-
+    '''
+    SWAG implementation for regression.
+    '''
     def __init__(self,net,epochs=50,lr=1e-3,cov_mat=True,max_num_models=0,var_clamp=1e-30):
         super(SWAG_R,self).__init__()
         self.swag_net = copy.deepcopy(net)

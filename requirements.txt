@@ -13,3 +13,4 @@ tqdm
 laplace-torch
 tensorflow
 openpyxl
+bayesian_torch
