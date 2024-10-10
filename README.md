@@ -15,5 +15,3 @@ you need to run the `image_classification.py` script once, and then again with t
 Adapted code for [LLA](https://github.com/AlexImmer/BNN-predictions) method and [SWAG](https://github.com/wjmaddox/swa_gaussian) method.
 
 
-
-
