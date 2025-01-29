@@ -1,12 +1,16 @@
 import torch
 from functorch import make_functional, make_functional_with_buffers
-from torch.func import vmap, jacrev, jvp
+from torch.func import functional_call, vmap, jacrev, jvp
 from torch import nn
 from torch.utils.data import DataLoader
 import tqdm
 import copy
+import time
+from torch.profiler import profile, record_function, ProfilerActivity
+import tracemalloc
 
 torch.set_default_dtype(torch.float64)
+
 
 device = (
     "cuda"
@@ -16,9 +20,13 @@ device = (
     else "cpu"
 )
 
-class classification_parallel(object):
+if device=='cuda':
+    torch.backends.cudnn.benchmark = True
+
+class small_classification_parallel(object):
     '''
-    NUQLS implementation for: classification, larger S. Per epoch training is much slower compared to serial implement, but overall is faster. Use for S > 10.
+    NUQLS implementation for: smaller dataset/model classification, e.g. lenet5 on FMNIST. 
+                        Larger S. Per epoch training is much slower compared to serial implement, but overall is faster. Use for S > 10.
     '''
     def __init__(self,net,train,S,epochs,lr,bs,bs_test,n_output,init_scale=1):
         self.net = net
@@ -39,15 +47,17 @@ class classification_parallel(object):
         self.theta = (torch.randn(size=(self.theta_t.shape[0],self.S),device=device)*self.init_scale + self.theta_t.unsqueeze(1)).detach()
 
         ## Create loaders and get entire training set
-        train_loader = DataLoader(self.train,batch_size=self.bs)
+        total_train_loader = DataLoader(self.train,batch_size=len(self.train))
+        X, Y = next(iter(total_train_loader))
+        X, Y = X.to(device), Y.to(device)
         test_loader = DataLoader(test,batch_size=self.bs_test)
         ood_test_loader = DataLoader(ood_test, batch_size=self.bs_test)
 
         ## Compute jacobian of net, evaluated on training set
-        def jacobian(X):
+        def jacobian(x):
             def fnet_single(params, x):
                 return self.fnet(params, x.unsqueeze(0)).squeeze(0)
-            J = vmap(jacrev(fnet_single), (None, 0))(self.params, X.to(device))
+            J = vmap(jacrev(fnet_single), (None, 0))(self.params, x.to(device))
             J = [j.detach().flatten(2) for j in J]
             J = torch.cat(J,dim=2).detach()
             return J
@@ -57,44 +67,35 @@ class classification_parallel(object):
             pbar = tqdm.trange(self.epochs)
         else:
             pbar = range(self.epochs)
+
+        J = jacobian(X)
         
         for epoch in pbar:
             loss = torch.zeros(self.S)
-            loss2 = 0
             accuracy = torch.zeros(self.S)
-            if gradnorm:
-                total_grad = 0
-            for x,y in train_loader:
-                x, y = x.to(device), y.to(device)
-                J = jacobian(x).detach()
-                with torch.no_grad():
-                    f_nlin = self.net(x)
-                    f_lin = (J.flatten(0,1) @ (self.theta.to(device) - self.theta_t.unsqueeze(1)) + 
-                            f_nlin.reshape(-1,1)).reshape(x.shape[0],self.n_output,self.S)
-                    Mubar = nn.functional.softmax(f_lin,dim=1).flatten(0,1)
-                    ybar = torch.nn.functional.one_hot(y,num_classes=self.n_output).flatten(0,1)
-                    grad = (J.flatten(0,1).T @ (Mubar - ybar.unsqueeze(1)) / x.shape[0])
+            with torch.no_grad():
+                f_nlin = self.net(x)
+                f_lin = (J.flatten(0,1) @ (self.theta.to(device) - self.theta_t.unsqueeze(1)) + 
+                        f_nlin.reshape(-1,1)).reshape(x.shape[0],self.n_output,self.S)
+                Mubar = nn.functional.softmax(f_lin,dim=1).flatten(0,1)
+                ybar = torch.nn.functional.one_hot(y,num_classes=self.n_output).flatten(0,1)
+                grad = (J.flatten(0,1).T @ (Mubar - ybar.unsqueeze(1)) / x.shape[0])
 
-                    loss -= 1 / x.shape[0] * torch.sum((ybar.unsqueeze(1) * torch.log(Mubar)),dim=0)
+                loss = - 1 / x.shape[0] * torch.sum((ybar.unsqueeze(1) * torch.log(Mubar)),dim=0)
 
-                    if epoch == 0:
-                        bt = grad
-                    else:
-                        bt = mu*bt + grad + weight_decay * self.theta
+                if epoch == 0:
+                    bt = grad
+                else:
+                    bt = mu*bt + grad + weight_decay * self.theta
 
-                    self.theta -= self.lr * bt
+                self.theta -= self.lr * bt
 
-                    accuracy += (f_lin.argmax(1) == y.unsqueeze(1)).type(torch.float).mean(dim=0)
-                    if gradnorm:
-                        total_grad += grad.detach()
+                accuracy = (f_lin.argmax(1) == y.unsqueeze(1)).type(torch.float).mean(dim=0)
+                if gradnorm:
+                    total_grad = grad.detach()
 
-            loss /= len(train_loader)
             loss = torch.max(loss) # Report maximum CE loss over realisations.
-            accuracy /= len(train_loader)
             accuracy = torch.min(accuracy) # Report minimum CE loss over realisations.
-            if gradnorm:
-                total_grad /= len(train_loader)
-
             if epoch % 1 == 0 and verbose:
                 print("\n-----------------")
                 print("Epoch {} of {}".format(epoch,self.epochs))
@@ -154,20 +155,16 @@ class small_regression_parallel(object):
         self.loss_fn = torch.nn.MSELoss(reduction='mean')
         self.fnet, self.params = make_functional(self.net)
         self.theta_t = flatten(self.params)
+        self.theta = torch.randn(size=(self.theta_t.shape[0],self.S),device=device)*self.init_scale + self.theta_t.unsqueeze(1)
         
 
-    def method(self,test,mu=0,weight_decay=0,my=0,sy=1,verbose=False):
+    def train_linear(self,mu=0,weight_decay=0,my=0,sy=1,threshold=None,verbose=False, progress_bar=True):
         ## Create new parameter to train
-        self.theta = torch.randn(size=(self.theta_t.shape[0],self.S),device=device)*self.init_scale + self.theta_t.unsqueeze(1)
         self.theta_init = self.theta.clone().detach()
 
         ## Create loaders and get entire training set
-        train_loader = DataLoader(self.train,batch_size=self.bs)
         train_loader_total = DataLoader(self.train,batch_size=len(self.train))
-        test_loader = DataLoader(test,batch_size=self.bs_test)
         X,Y = next(iter(train_loader_total))
-        f_diff = torch.empty((self.epochs))
-        param_diff = torch.empty((self.epochs))
 
         ## Compute jacobian of net, evaluated on training set
         def fnet_single(params, x):
@@ -175,14 +172,20 @@ class small_regression_parallel(object):
         J = vmap(jacrev(fnet_single), (None, 0))(self.params, X.to(device))
         J = [j.detach().flatten(1) for j in J]
         J = torch.cat(J,dim=1).detach()
+
+        # Set progress bar
+        if progress_bar:
+            pbar = tqdm.trange(self.epochs)
+        else:
+            pbar = range(self.epochs)
         
         ## Train S realisations of linearised networks
-        for epoch in range(self.epochs):
-            X, Y = X.to(device), Y.to(device)
-
+        for epoch in pbar:
+            X, Y = X.to(device), Y.to(device).reshape(-1,1)
+            
             f_nlin = self.net(X)
             f_lin = (J.to(device) @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin).detach()
-            resid = f_lin - Y.unsqueeze(1)
+            resid = f_lin - Y
             grad = J.T.to(device) @ resid.to(device) / X.shape[0] + weight_decay * self.theta
 
             if epoch == 0:
@@ -192,15 +195,26 @@ class small_regression_parallel(object):
 
             self.theta -= self.lr * bt
 
+            loss = torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y)).max()
+            if threshold is not None and loss < threshold:
+                break
+
             if epoch % 100 == 0 and verbose:
                 print("\n-----------------")
                 print("Epoch {} of {}".format(epoch,self.epochs))
-                print("max l2 loss = {}".format(torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y.unsqueeze(1))).max()))
-                print("Residual of normal equation l2 = {}".format(torch.mean(torch.square(J.T @ ( f_nlin + J @ (self.theta - self.theta_t.unsqueeze(1)) - Y.unsqueeze(1))))))
+                print("max l2 loss = {}".format(torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y)).max()))
+                print("Residual of normal equation l2 = {}".format(torch.mean(torch.square(J.T @ ( f_nlin + J @ (self.theta - self.theta_t.unsqueeze(1)) - Y)))))
 
         # Report maximum loss over S, and the mean gradient norm
-        max_l2_loss = torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y.unsqueeze(1))).max()
-        norm_resid = torch.mean(torch.square(J.T @ ( f_nlin + J @ (self.theta - self.theta_t.unsqueeze(1)) - Y.unsqueeze(1))))
+        max_l2_loss = torch.mean(torch.square(J @ (self.theta - self.theta_t.unsqueeze(1)) + f_nlin - Y)).max()
+        norm_resid = torch.mean(torch.square(J.T @ ( f_nlin + J @ (self.theta - self.theta_t.unsqueeze(1)) - Y)))
+
+        return max_l2_loss.detach(), norm_resid.detach()
+    
+    def test_linear(self,test,my=0,sy=1):
+        def fnet_single(params, x):
+            return self.fnet(params, x.unsqueeze(0)).squeeze(0)
+        test_loader = DataLoader(test,batch_size=self.bs_test)
                 
         # Concatenate predictions
         pred_s = []
@@ -215,9 +229,9 @@ class small_regression_parallel(object):
             pred_s.append(pred_lin.detach()*sy + my)
 
         predictions = torch.cat(pred_s,dim=1)
-        return predictions, max_l2_loss, norm_resid
+        return predictions
 
-def series_method(net, train_data, test_data, ood_test_data=None, regression = False, train_bs = 100, test_bs = 100, S = 10, scale=1, lr=1e-3, epochs=20, mu=0.9, wd = 0, verbose=False, progress_bar = True):
+def series_method(net, train_data, test_data, ood_test_data=None, regression = False, scheduler_true = False, train_bs = 100, test_bs = 100, S = 10, scale=1, lr=1e-3, epochs=20, mu=0.9, wd = 0, verbose=False, progress_bar = True):
     '''
     NUQLS implementation for: either regression/classification, small S. 
     Per epoch training is much faster compared to parallel implement, overall speed is faster when S <= 10.
@@ -273,6 +287,8 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
             loss_fn = torch.nn.CrossEntropyLoss()
         else:
             loss_fn = torch.nn.MSELoss()
+        if scheduler_true:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim,T_max=epochs)
 
         for epoch in range(epochs):
             loss_e = 0
@@ -287,6 +303,8 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
                 if not regression:
                     acc_e += (pred.argmax(1) == y).type(torch.float).sum().item()
                 optim.step()
+            if scheduler_true:
+                scheduler.step()
             
             loss_e /= len(train_loader)
             if not regression:
@@ -304,6 +322,7 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
                 print(f"acc: {acc_e:.1%}\n")
 
         if loss_e > res["loss"]:
+            print(f'loss = {loss_e}')
             res['loss'] = loss_e
         if acc_e < res['acc']:
             res['acc'] = acc_e
@@ -332,6 +351,359 @@ def series_method(net, train_data, test_data, ood_test_data=None, regression = F
       return id_predictions, ood_predictions, res
 
     return id_predictions, res
+
+def regression_parallel(net, train, test, ood_test=None, train_bs=50, test_bs=50, scale=1, S=10, epochs=100, lr=1e-3, mu=0.9):
+    fnet, params = make_functional(net)
+    theta_t = flatten(params)
+
+    num_p = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    
+    train_loader = DataLoader(train,train_bs)
+    test_loader = DataLoader(test,batch_size=test_bs)
+    if ood_test is not None:
+        ood_test_loader = DataLoader(ood_test,batch_size=test_bs)
+
+    def fnet_single(params, x):
+        return fnet(params, x.unsqueeze(0)).squeeze(0)
+
+    p = copy.deepcopy(params)
+    theta_S = torch.empty((num_p,S), device=device)
+
+    for s in range(S):
+        theta_star = []
+        for pi in p:
+            theta_star.append(torch.nn.parameter.Parameter(torch.randn(size=pi.shape,device=device)*scale + pi.to(device)))
+        theta_S[:,s] = flatten(theta_star)
+
+    def jvp_first(theta_s,params,x):
+        dparams = _sub(tuple(unflatten_like(theta_s, params)),params)
+        _, proj = torch.func.jvp(lambda param: fnet(param, x),
+                                (params,), (dparams,))
+        return proj
+
+    def vjp_second(resid_s,params,x):
+        _, vjp_fn = torch.func.vjp(lambda param: fnet(param, x), params)
+        vjp = vjp_fn(resid_s.unsqueeze(1))
+        return vjp
+    
+    print(f'mem before = {(1e-9*torch.cuda.memory_allocated()):.4}')
+
+    for epoch in tqdm.trange(epochs):
+        torch.cuda.reset_peak_memory_stats()
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            f_nlin = net(x)
+            proj = torch.vmap(jvp_first, (1,None,None))(theta_S,params,x).flatten(1).T
+            f_lin = (proj + f_nlin).detach()
+            resid = f_lin - y
+            projT = torch.vmap(vjp_second, (1,None,None))(resid,params,x)
+            vjp = [j.detach().flatten(1) for j in projT[0]]
+            vjp = torch.cat(vjp,dim=1).detach()
+            g = vjp.T / x.shape[0]
+
+            if epoch == 0:
+                bt = g
+            else:
+                bt = mu*bt + g
+
+            theta_S -= lr*bt
+
+        if epoch % 1 == 0:
+            print("\n-----------------")
+            print("Epoch {} of {}".format(epoch,epochs))
+            print("max l2 loss = {:.4}".format(torch.mean(torch.square(resid)).max()))
+            print("Residual of normal equation l2 = {:.4}".format(torch.mean(torch.square(g))))
+            print(f'Max Mem used = {(1e-9*torch.cuda.max_memory_allocated()):.3} gb')
+
+
+    # Concatenate predictions
+    pred_test = []
+    for x,_ in test_loader:
+        x = x.to(device)
+        f_nlin = net(x)
+        proj = torch.vmap(jvp_first, (1,None,None))(theta_S,params,x).flatten(1).T
+        pred = proj + f_nlin
+        pred_test.append(pred.detach())
+
+    id_predictions = torch.cat(pred_test,dim=0)
+
+    if ood_test is not None:
+        pred_test = []
+        for x,_ in ood_test_loader:
+            x = x.to(device)
+            f_nlin = net(x)
+            proj = torch.vmap(jvp_first, (1,None,None))(theta_S,params,x).flatten(1).T
+            pred = proj + f_nlin
+            pred_test.append(pred.detach())
+
+        ood_predictions = torch.cat(pred_test,dim=0)
+
+    if ood_test is not None:
+      return id_predictions, ood_predictions
+
+    return id_predictions
+
+class classification_parallel_i(object):
+    def __init__(self, net):
+        self.net = net
+
+    
+
+    def train(self, train, train_bs=50, n_output = 10, scale=1, S=10, epochs=100, lr=1e-3, mu=0.9, verbose=False, progress_bar=True):
+        
+        train_loader = DataLoader(train,train_bs,num_workers=0, pin_memory=False, pin_memory_device=device)
+
+        params = {k: v.detach() for k, v in self.net.named_parameters()}
+        num_p = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+
+        def fnet(params, x):
+            return functional_call(self.net, params, x)
+
+        p = copy.deepcopy(params).values()
+        theta_S = torch.empty((num_p,S), device=device)
+
+        def jvp_first(theta_s,params,x):
+            dparams = _dub(unflatten_like(theta_s, params.values()),params)
+            _, proj = torch.func.jvp(lambda param: fnet(param, x),
+                                    (params,), (dparams,))
+            proj = proj.detach()
+            return proj
+
+        def vjp_second(resid_s,params,x):
+            _, vjp_fn = torch.func.vjp(lambda param: fnet(param, x), params)
+            vjp = vjp_fn(resid_s)
+            return vjp
+        
+        for s in range(S):
+            theta_star = []
+            for pi in p:
+                theta_star.append(torch.nn.parameter.Parameter(torch.randn(size=pi.shape,device=device)*scale + pi.to(device)))
+            theta_S[:,s] = flatten(theta_star).detach()
+
+        theta_S = theta_S.detach()
+        
+        if progress_bar:
+            pbar = tqdm.trange(epochs)
+        else:
+            pbar = range(epochs)
+        
+        with torch.no_grad():
+            for epoch in pbar:
+                loss = 0
+                i = 0
+                for j,(x,y) in enumerate(train_loader):
+                    print(f'{j}: {len(train) / train_bs}')
+                    x, y = x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
+                    f_nlin = self.net(x)
+                    proj = torch.vmap(jvp_first, (1,None,None))((theta_S),params,x).permute(1,2,0)
+                    f_lin = (proj + f_nlin.unsqueeze(2))
+                    Mubar = torch.clamp(nn.functional.softmax(f_lin,dim=1),1e-32,1)
+                    ybar = torch.nn.functional.one_hot(y,num_classes=n_output)
+                    resid = (Mubar - ybar.unsqueeze(2))
+                    projT = torch.vmap(vjp_second, (2,None,None))(resid,params,x)
+                    vjp = [j.detach().flatten(1) for j in projT[0].values()]
+                    vjp = torch.cat(vjp,dim=1).detach()
+                    g = (vjp.T / x.shape[0]).detach()
+
+                    if epoch == 0:
+                        bt = g
+                    else:
+                        bt = mu*bt + g
+                    theta_S -= lr*bt
+
+                    l = (-1 / x.shape[0] * torch.sum((ybar.unsqueeze(2) * torch.log(Mubar)),dim=(0,1))).detach()
+                    loss += l
+
+                loss /= len(train_loader)
+                if verbose:        
+                    if epoch % 1 == 0:
+                        print("\n-----------------")
+                        print("Epoch {} of {}".format(epoch+1,epochs))
+                        print("max ce loss = {:.4}".format(loss.max()))
+                        print("Residual of normal equation l2 = {:.4}".format(torch.mean(torch.square(g))))
+                        print(f'Max Mem used = {(1e-9*torch.cuda.max_memory_allocated()):.3} gb')
+        
+        if verbose:
+            print('Posterior samples computed!')
+        self.theta_S = theta_S
+
+        if epochs == 0:
+            return 0.0
+
+        return loss.max().item()
+    
+    def test(self, test, test_bs=50):
+        params = {k: v.detach() for k, v in self.net.named_parameters()}
+
+        test_loader = DataLoader(test, test_bs)
+
+        def fnet(params, x):
+            return functional_call(self.net, params, x)
+
+        def jvp_first(theta_s,params,x):
+            dparams = _dub(unflatten_like(theta_s, params.values()),params)
+            _, proj = torch.func.jvp(lambda param: fnet(param, x),
+                                    (params,), (dparams,))
+            proj = proj.detach()
+            return proj
+        
+        # Concatenate predictions
+        pred_s = []
+        for i,(x,y) in enumerate(test_loader):
+            print(f'{i}: {len(test) / test_bs}')
+            x, y = x.to(device), y.to(device)
+            f_nlin = self.net(x)
+            proj = torch.vmap(jvp_first, (1,None,None))((self.theta_S),params,x).permute(1,2,0)
+            f_lin = (proj + f_nlin.unsqueeze(2))
+            pred_s.append(f_lin.detach())
+
+        id_predictions = torch.cat(pred_s,dim=0).permute(2,0,1) # N x C x S ---> S x N x C
+        
+        del f_lin
+        del pred_s
+    
+        return id_predictions
+
+
+# def classification_parallel_i(net, train, test, ood_test=None, train_bs=50, test_bs=50, n_output = 10, scale=1, S=10, epochs=100, lr=1e-3, mu=0.9):
+#     # fnet, params = make_functional(net)
+#     # theta_t = flatten(params)
+
+#     # Detaching the parameters because we won't be calling Tensor.backward().
+#     params = {k: v.detach() for k, v in net.named_parameters()}
+
+#     def fnet(params, x):
+#         return functional_call(net, params, x)
+
+#     num_p = sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+#     train_loader = DataLoader(train,train_bs,num_workers=0, pin_memory=False, pin_memory_device=device)
+#     test_loader = DataLoader(test,batch_size=test_bs)
+#     if ood_test is not None:
+#         ood_test_loader = DataLoader(ood_test,batch_size=test_bs)
+
+#     def fnet_single(params, x):
+#         return fnet(params, x.unsqueeze(0)).squeeze(0)
+
+#     p = copy.deepcopy(params).values()
+#     theta_S = torch.empty((num_p,S), device=device)
+
+#     for s in range(S):
+#         theta_star = []
+#         for pi in p:
+#             theta_star.append(torch.nn.parameter.Parameter(torch.randn(size=pi.shape,device=device)*scale + pi.to(device)))
+#         theta_S[:,s] = flatten(theta_star).detach()
+
+#     theta_S = theta_S.detach()
+
+#     def jvp_first(theta_s,params,x):
+#         dparams = _dub(unflatten_like(theta_s, params.values()),params)
+#         _, proj = torch.func.jvp(lambda param: fnet(param, x),
+#                                 (params,), (dparams,))
+#         proj = proj.detach()
+#         return proj
+
+#     # def jvp_first(jvp,theta_s,params):
+#     #     dparams = _dub(unflatten_like(theta_s, params.values()),params)
+#     #     proj = jvp((dparams,)).detach()
+#     #     return proj
+
+#     def vjp_second(resid_s,params,x):
+#         _, vjp_fn = torch.func.vjp(lambda param: fnet(param, x), params)
+#         vjp = vjp_fn(resid_s)
+#         return vjp
+    
+
+#     def jvp_first_old(theta_s,params,x):
+#         torch.cuda.synchronize(device)
+#         t = time.time()
+#         dparams = _sub(tuple(unflatten_like(theta_s, params)),params)
+#         t1 = time.time() - t
+#         print(f't1 = {t1}')
+
+#         torch.cuda.synchronize(device)
+#         t = time.time()
+#         _, proj = torch.func.jvp(lambda param: fnet(param, x),
+#                                 (params,), (dparams,))
+#         t2 = time.time() - t
+#         print(f't2 = {t2}')
+#         return proj
+
+#     def vjp_second_old(resid_s,params,x):
+#         _, vjp_fn = torch.func.vjp(lambda param: fnet(param, x), params)
+#         vjp = vjp_fn(resid_s)
+#         return vjp
+    
+#     # print(f'mem before = {(1e-9*torch.cuda.memory_allocated()):.4}')
+#     # tracemalloc.start()
+#     # current, peak =  tracemalloc.get_traced_memory()
+#     # print(f"{current:0.2f}, {peak:0.2f}")
+#     with torch.no_grad():
+#         for epoch in tqdm.trange(epochs):
+#             loss = 0
+            
+#             # tload = time.time()
+#             i = 0
+#             for x,y in train_loader:
+#                 x, y = x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
+#                 f_nlin = net(x)
+#                 proj = torch.vmap(jvp_first, (1,None,None))(theta_S,params,x).permute(1,2,0)
+#                 f_lin = (proj + f_nlin.unsqueeze(2))
+#                 Mubar = nn.functional.softmax(f_lin,dim=1)
+#                 ybar = torch.nn.functional.one_hot(y,num_classes=n_output)
+#                 resid = (Mubar - ybar.unsqueeze(2))
+#                 projT = torch.vmap(vjp_second, (2,None,None))(resid,params,x)
+#                 vjp = [j.detach().flatten(1) for j in projT[0].values()]
+#                 vjp = torch.cat(vjp,dim=1).detach()
+#                 g = (vjp.T / x.shape[0]).detach()
+
+#                 if epoch == 0:
+#                     bt = g
+#                 else:
+#                     bt = mu*bt + g
+#                 theta_S -= lr*bt
+
+#                 l = (-1 / x.shape[0] * torch.sum((ybar.unsqueeze(2) * torch.log(Mubar)),dim=(0,1))).detach()
+#                 # print(l)
+#                 loss += l
+
+#                 # print(f'Max Mem used = {(1e-9*torch.cuda.max_memory_allocated()):.3} gb')
+#                     # print("Residual of normal equation l2 = {:.4}".format(torch.mean(torch.square(g))))
+#             loss /= len(train_loader)        
+#             # if epoch % 1 == 0:
+#             #     print("\n-----------------")
+#             #     print("Epoch {} of {}".format(epoch,epochs))
+#             #     print("max ce loss = {:.4}".format(loss.max()))
+#             #     print("Residual of normal equation l2 = {:.4}".format(torch.mean(torch.square(g))))
+#             #     print(f'Max Mem used = {(1e-9*torch.cuda.max_memory_allocated()):.3} gb')
+    
+#     # Concatenate predictions
+#         pred_s = []
+#         for x,y in test_loader:
+#             x, y = x.to(device), y.to(device)
+#             f_nlin = net(x)
+#             proj = torch.vmap(jvp_first, (1,None,None))(theta_S,params,x).permute(1,2,0)
+#             f_lin = (proj + f_nlin.unsqueeze(2))
+#             pred_s.append(f_lin.detach())
+
+#         id_predictions = torch.cat(pred_s,dim=0).permute(2,0,1) # N x C x S ---> S x N x C
+
+#         if ood_test is not None:
+#             pred_s = []
+#             for x,y in ood_test_loader:
+#                 x, y = x.to(device), y.to(device)
+#                 f_nlin = net(x)
+#                 proj = torch.vmap(jvp_first, (1,None,None))(theta_S,params,x).permute(1,2,0)
+#                 f_lin = (proj + f_nlin.unsqueeze(2))
+#                 pred_s.append(f_lin.detach())
+
+#             ood_predictions = torch.cat(pred_s,dim=0).permute(2,0,1) # N x C x S ---> S x N x C
+#             return id_predictions, ood_predictions, loss.max()
+        
+#         del f_lin
+#         del pred_s
+    
+#         return id_predictions, loss.max()
  
 def linearize(f, params):
   def f_lin(p, *args, **kwargs):
@@ -342,7 +714,10 @@ def linearize(f, params):
   return f_lin
 
 def _sub(x, y):
-  return tuple(x - y for (x, y) in zip(x, y))
+    return tuple(x - y for (x, y) in zip(x, y))
+
+def _dub(x,y):
+    return {yi:xi - y[yi] for (xi, yi) in zip(x, y)}
 
 def flatten(lst):
     tmp = [i.contiguous().view(-1, 1) for i in lst]

@@ -123,6 +123,17 @@ def init_weights(m):
     if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv2d:
         torch.nn.init.xavier_uniform_(m.weight)
 
+def init_weights_he(m):
+    if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv2d:
+        torch.nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
+        torch.nn.init.constant_(m.bias, 0)
+
+def init_weights_resnetsmall(m):
+    if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv2d:
+        torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    if type(m) == torch.nn.Linear:
+        torch.nn.init.constant_(m.bias, 0)
+
 def weights_init_ff(m):
     if isinstance(m, torch.nn.Linear):
         torch.nn.init.xavier_normal_(m.weight)

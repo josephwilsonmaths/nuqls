@@ -2,30 +2,40 @@
 import torch
 import numpy as np
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
-import pandas as pd
-import scipy
-from scipy.io import arff
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import posteriors.nuqls as nuqls
 from posteriors.lla.models import MLPS
 from posteriors.lla.likelihoods import GaussianLh
 from posteriors.lla.laplace import Laplace
+import posteriors.lla_s as lla_s
 import argparse
 import time
 import os
+import configparser
+import utils.datasets
+import json
+import posteriors.util as util
+import posteriors.swag as swag
+import utils.regression_util as utility
 
 torch.set_default_dtype(torch.float64)
 
 parser = argparse.ArgumentParser(description='Regression Experiment')
+# parser.add_argument('--dataset', required=True,type=str,help='Relative path to list of datasets. Each dataset should be placed on new line with no whitespace around it.')
 parser.add_argument('--dataset', required=True,type=str,help='Dataset')
 parser.add_argument('--n_experiment',default=10,type=int,help='number of experiments')
 parser.add_argument('--activation',default='tanh',type=str,help='Non-linear activation for MLP')
-parser.add_argument('--nuqls_epoch',default=1000,type=int,help='epochs for nuqls.')
-parser.add_argument('--nuqls_S',default=100,type=int,help='num realisations for nuqls.')
-parser.add_argument('--nuqls_lr',default=5e-4,type=float,help='lr for nuqls.')
+parser.add_argument('--verbose', action='store_true',help='verbose flag for results')
+parser.add_argument('--extra_verbose', action='store_true',help='verbose flag for training')
+parser.add_argument('--progress_bar', action='store_true',help='progress bar flag for all methods')
 args = parser.parse_args()
+
+# # Parse datasets
+# r = open(args.dataset,"r")
+# datasets = []
+# for d in r:
+#     datasets.append(d.strip())
 
 # Get cpu, gpu or mps device for training.
 device = (
@@ -37,200 +47,40 @@ device = (
 )
 print(f"\n Using {device} device")
 
-### --- INPUT DATA HERE AS WELL AS DATASET NAME --- ###
+# # Iterate through datasets:
+# for dataset in datasets:
 
-if args.dataset == 'energy':
-    df = pd.read_excel('./data/energy/ENB2012_data.xlsx')
-    input_dim = 8
-    hidden_sizes = [150]
-    epochs = 1500
-    de_epochs = 1500
-elif args.dataset == 'concrete':
-    df = pd.read_excel('./data/concrete/Concrete_Data.xls')
-    input_dim = 8
-    hidden_sizes = [150]
-    epochs = 1500
-    de_epochs = 300
-elif args.dataset == 'kin8nm':
-    arff_file = arff.loadarff('./data/kin8mn/dataset_2175_kin8nm.arff')
-    df = pd.DataFrame(arff_file[0])
-    input_dim = 8
-    hidden_sizes = [100,100]
-    epochs = 500
-    de_epochs = 100
+# Get hyperparameters from config file
+config = configparser.ConfigParser()
+config.read('utils/regression.ini')
+df = utils.datasets.read_regression(args.dataset)
+n_experiment = config.getint(args.dataset,'n_experiment')
+input_start = config.getint(args.dataset,'input_start')
+input_dim = config.getint(args.dataset,'input_dim')
+target_dim = config.getint(args.dataset,'target_dim')
+hidden_sizes = json.loads(config.get(args.dataset,'hidden_sizes'))
+epochs = config.getint(args.dataset,'epochs')
+lr = config.getfloat(args.dataset,'lr')
+de_epochs = config.getint(args.dataset,'de_epochs')
+de_lr = config.getfloat(args.dataset,'de_lr')
+weight_decay = config.getfloat(args.dataset,'weight_decay')
+nuqls_S = config.getint(args.dataset,'nuqls_S')
+nuqls_epoch = config.getint(args.dataset,'nuqls_epoch')
+nuqls_lr = config.getfloat(args.dataset,'nuqls_lr')
 
-# print(data.shape)
+# Fixed parameters
+train_ratio = 0.7
+normalize = True
+batch_size = 200
+mse_loss = nn.MSELoss(reduction='mean')
+nll = torch.nn.GaussianNLLLoss()
+S = 10
+
+# Give dataframe summary
 print("--- Loading dataset {} --- \n".format(args.dataset))
 print("Number of data points = {}".format(len(df)))
 print("Number of coloumns = {}".format(len(df.columns)))
-print("Number of features = {}".format(input_dim))
-
-## Calibration function (ECE)
-def calibration_curve_r(loader,mean,variance,c):
-    predicted_conf = torch.linspace(0,1,c)
-    observed_conf = torch.empty((c))
-    for i,ci in enumerate(predicted_conf):
-        z = scipy.stats.norm.ppf((1+ci)/2)
-        ci_l = mean.reshape(-1) - z*torch.sqrt(variance.reshape(-1))
-        ci_r = mean.reshape(-1) + z*torch.sqrt(variance.reshape(-1)) 
-        correct = 0
-        for iy,(_,y) in enumerate(loader):
-            y = y.to(device)
-            if ci_l[iy] < y.reshape(-1) and y.reshape(-1) < ci_r[iy]:
-                correct += 1
-        observed_conf[i] = correct / len(loader)
-    return observed_conf,predicted_conf
-
-class RegressionDataset(Dataset):
-    '''
-    Prepare dataset for regression.
-    Input the number of features.
-
-    Input:
-    - dataset: numpy array
-
-    Returns:
-        - Tuple (X,y) - X is a numpy array, y is a double value.
-    '''
-    def __init__(self, dataset, input_dim, mX=0, sX=1, my=0, sy=1):
-        self.X, self.y = dataset[:,:input_dim], dataset[:,input_dim]
-        self.X, self.y = (self.X - mX)/sX, (self.y - my)/sy
-        self.len_data = self.X.shape[0]
-
-    def __len__(self):
-        return self.len_data
-
-    def __getitem__(self, i):
-        return self.X[i,:], self.y[i]
-        
-def weights_init(m):
-    if isinstance(m, nn.Linear):
-        nn.init.xavier_normal_(m.weight)
-        # nn.init.normal_(m.weight,mean=0,std=1)
-        nn.init.normal_(m.bias,mean=0,std=1)
-
-def train(dataloader, model, optimizer, loss_function, scheduler=None):
-    model.train()
-    train_loss = 0
-    for i, (X,y) in enumerate(dataloader):
-        X,y = X.to(device), y.to(device)
-        # Get and prepare inputs
-        y = y.reshape(-1,1)
-        
-        # Perform forward pass
-        pred = model(X)
-        
-        # Compute loss
-        loss = loss_function(pred, y)
-        
-        # Perform backward pass
-        loss.backward()
-
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        optimizer.zero_grad()
-
-        train_loss += loss.item()
-
-    train_loss = train_loss / (i+1)
-    return train_loss
-
-def test(dataloader, model, my, sy, loss_function):
-    model.eval()
-    test_loss = 0
-    with torch.no_grad():
-        for i, (X, y) in enumerate(dataloader):
-            X,y = X.to(device), y.to(device)
-            y = y.reshape((y.shape[0],1))
-            pred = model(X)
-            pred = pred * sy + my
-            test_loss += loss_function(pred, y).item()
-    test_loss /= (i+1)
-    return test_loss
-
-def to_np(x):
-    return x.cpu().detach().numpy()
-
-class EnsembleNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.linear_1 = nn.Linear(input_dim,hidden_sizes[0])
-        if len(hidden_sizes) > 1:
-            self.linear_2 = nn.Linear(hidden_sizes[1],hidden_sizes[1])
-        if args.activation == 'tanh':
-            self.act = nn.Tanh()
-        elif args.activation == 'relu':
-            self.act = nn.ReLU()
-        self.linear_mu = nn.Linear(hidden_sizes[-1],1)
-        self.linear_sig = nn.Linear(hidden_sizes[-1],1)
-
-    def forward(self, x):
-        x = self.act(self.linear_1(x))
-        if len(hidden_sizes) > 1:
-            x = self.act(self.linear_2(x))
-        mu = self.linear_mu(x)
-        variance = self.linear_sig(x)
-        variance = F.softplus(variance) + 1e-6
-        return mu, variance
-
-class CustomNLL(nn.Module):
-    def __init__(self):
-        super(CustomNLL, self).__init__()
-
-    def forward(self, y, mean, var):
-        
-        loss = (0.5*torch.log(var) + 0.5*(y - mean).pow(2)/var).mean() + 1
-
-        if np.any(np.isnan(to_np(loss))):
-            print(torch.log(var))
-            print((y - mean).pow(2)/var)
-            raise ValueError('There is Nan in loss')
-        
-        return loss
-
-def train_de(dataloader, model, optimizer, loss_function, scheduler=None):
-    model.train()
-    train_loss = 0
-    for i, (X,y) in enumerate(dataloader):
-        X,y = X.to(device), y.to(device)
-        y = y.reshape((-1,1))
-        pred, var = model(X)
-        loss = loss_function(pred, y, var)
-        
-        # Perform backward pass
-        loss.backward()
-        
-        # Perform optimization
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        optimizer.zero_grad()
-
-        train_loss += loss.item()
-
-    train_loss = train_loss / (i+1)
-    return train_loss
-
-def test_de(dataloader, model, my, sy, loss_function, mse_loss):
-    model.eval()
-    test_loss = 0
-    mse = 0
-    with torch.no_grad():
-        for i, (X, y) in enumerate(dataloader):
-            X,y = X.to(device), y.to(device)
-            y = y.reshape((-1,1))
-            mean, variance = model(X)
-            mean = mean * sy + my
-            variance = variance * (sy**2)
-            test_loss += loss_function(mean, y, variance).item()
-            mse += mse_loss(mean,y).item()
-    test_loss /= (i+1)
-    mse /= (i+1)
-    return test_loss, mse
-
-train_ratio = 0.7
-normalize = True
+print("Number of features = {}".format(input_dim-input_start))
 
 ## Num of points and dimension of data
 num_points = len(df)
@@ -243,90 +93,218 @@ dataset_numpy = df.values
 
 # Normalize the dataset
 if normalize:
-    mx = dataset_numpy[:,:input_dim].mean(0)
-    my = dataset_numpy[:,input_dim].mean(0)
-    sx = dataset_numpy[:,:input_dim].std(0)
-    sy = dataset_numpy[:,input_dim].std(0)
-
-# Training parameters
-lr = 1e-3
-weight_decay = 1e-5
-batch_size = 100
-mse_loss = nn.MSELoss(reduction='mean')
-nll = torch.nn.GaussianNLLLoss()
-S = 10
+    mx = dataset_numpy[:,input_start:input_dim].mean(0)
+    my = dataset_numpy[:,target_dim].mean(0)
+    sx = dataset_numpy[:,input_start:input_dim].std(0)
+    sx = np.where(sx==0,1,sx)
+    sy = dataset_numpy[:,target_dim].std(0)
+    sy = np.where(sy==0,1,sy)
 
 # Setup metrics
-methods = ['MAP','NUQLs','DE','LLA']
-train_methods = ['MAP','NUQLs','DE']
+methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG'] 
+# methods = ['MAP','NUQLS','NUQLS_MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','NUQLS_SCALE_T','NUQLS_SCALE_T_MAP','DE','LLA','SWAG']
+# methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG']
+# methods = ['MAP','DE']
+train_methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE']
 test_res = {}
 train_res = {}
 for m in methods:
     if m in train_methods:
         train_res[m] = {'loss': []}
     test_res[m] = {'rmse': [],
-                  'nll': [],
-                  'ece': [],
-                  'time': []}
+                'nll': [],
+                'ece': [],
+                'time': []}
 
-
-for ei in tqdm(range(args.n_experiment)):
+# Iterate through number of experiments
+for ei in tqdm(range(n_experiment)):
     print("\n--- experiment {} ---".format(ei))
     np.random.shuffle(dataset_numpy) # Randomness
     training_set, validation_set, test_set = dataset_numpy[:train_size,:], dataset_numpy[train_size:train_size+validation_size], dataset_numpy[train_size+validation_size:,:]
 
-    train_dataset = RegressionDataset(training_set, input_dim=input_dim, mX=mx, sX=sx, my=my, sy=sy)
-    validation_dataset = RegressionDataset(validation_set, input_dim=input_dim, mX=mx, sX=sx, my=my, sy=sy)
-    test_dataset = RegressionDataset(test_set, input_dim=input_dim, mX=mx, sX=sx, my=my, sy=sy)
+    train_dataset = utils.datasets.RegressionDataset(training_set, 
+                                    input_start=input_start, input_dim=input_dim, target_dim=target_dim,
+                                    mX=mx, sX=sx, my=my, sy=sy)
+    validation_dataset = utils.datasets.RegressionDataset(validation_set, 
+                                    input_start=input_start, input_dim=input_dim, target_dim=target_dim,
+                                    mX=mx, sX=sx, my=my, sy=sy)
+    test_dataset = utils.datasets.RegressionDataset(test_set, 
+                                    input_start=input_start, input_dim=input_dim, target_dim=target_dim,
+                                    mX=mx, sX=sx, my=my, sy=sy)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=test_size, shuffle=False)
-    test_x, test_y = next(iter(test_loader))
+    _, test_y = next(iter(test_loader))
+
     calibration_test_loader = DataLoader(test_dataset,1)
-    calibration_test_loader_val = DataLoader(validation_dataset,1)
+    calibration_test_loader_val = DataLoader(validation_dataset,len(validation_dataset))
+    _, val_y = next(iter(calibration_test_loader_val))
 
     for m in methods:
+        print(f'METHOD:: {m}')
         t1 = time.time()
         if m == 'MAP':
-            map_net = MLPS(input_size=input_dim, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
-            map_net.apply(weights_init)
+            map_net = MLPS(input_size=input_dim-input_start, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
+            # map_net = ResRegressionDNN().to(device=device,dtype=torch.float64)
+            map_net.apply(utility.weights_init)
             map_p = sum(p.numel() for p in map_net.parameters() if p.requires_grad)
-
-            adam_optimizer = torch.optim.Adam(map_net.parameters(), lr=lr, weight_decay=weight_decay)
-            scheduler = torch.optim.lr_scheduler.PolynomialLR(adam_optimizer, total_iters=epochs*10, power=0.5)
+            print(f'parameters of network = {map_p}')
+            
+            if args.dataset=='kin8nm' or args.dataset=='wine' or args.dataset=='naval' or args.dataset=='protein' or args.dataset=='song':
+                optimizer = torch.optim.SGD(map_net.parameters(),lr=lr, weight_decay=weight_decay, momentum=0.9)
+                scheduler = None
+            else:
+                optimizer = torch.optim.Adam(map_net.parameters(), lr=lr, weight_decay=weight_decay)
+                scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=epochs*10, power=0.5)
 
             # Run the training loop
             for epoch in tqdm(range(epochs)):
-                map_train_loss  = train(train_loader, map_net, optimizer=adam_optimizer, loss_function=mse_loss, scheduler=scheduler)
-                map_test_loss = test(test_loader, map_net, my=0, sy=1, loss_function=mse_loss)
+                map_train_loss  = utility.train(train_loader, map_net, optimizer=optimizer, loss_function=mse_loss, scheduler=scheduler)
+                map_test_loss = utility.test(test_loader, map_net, my=0, sy=1, loss_function=mse_loss)
+                if args.extra_verbose and epoch % 10 == 0:
+                    print("Epoch {} of {}".format(epoch,epochs))
+                    print("Training loss = {:.4f}".format(map_train_loss))
+                    print("Test loss = {:.4f}".format(map_test_loss))
+                    print("\n -------------------------------------")
             train_res['MAP']['loss'].append(map_train_loss)
 
-        elif m == 'NUQLs':
-            best_scale = 1e17
-            best_ece = 1.01
-            scales = torch.linspace(0,1,20)
+            print(f'MAP: TEST RMSE = {np.sqrt(map_test_loss):.4}')
 
-            for s,scale in enumerate(scales):
-                nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=scale)
-                new_nuqls_predictions,_,_ = nuqls_model.method(validation_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
-                new_observed_conf_nuqls, new_predicted_conf = calibration_curve_r(calibration_test_loader_val,new_nuqls_predictions.mean(1),new_nuqls_predictions.var(1),11)
-                new_ece_nuqls = torch.mean(torch.square(new_observed_conf_nuqls - new_predicted_conf))
-                if new_ece_nuqls < best_ece:
-                    best_ece = new_ece_nuqls
-                    nuqls_predictions = new_nuqls_predictions
-                    best_scale = scale
-                    # print("New best ece = {}".format(new_ece_nuqls))
-                    # print("New best scale = {}".format(best_scale))
+            map_pred = []
+            for x,_ in test_loader:
+                x = x.to(device)
+                map_pred.append(map_net(x))
+            map_test_pred = torch.cat(map_pred)
+
+            map_pred = []
+            val_loader = DataLoader(validation_dataset, batch_size=test_size, shuffle=False)
+            for x,_ in val_loader:
+                x = x.to(device)
+                map_pred.append(map_net(x))
+            map_val_pred = torch.cat(map_pred)
+
+        elif m == 'NUQLS_SCALE_S':
+
+            left_scale, right_scale, k_scale = 0.1, 100, 20
+
+            if args.dataset=='song':
+                # # Train model for gamma = 0.1 (as reference) and get predictions
+                # val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
+                #                                 regression= 'True', train_bs = train_size, test_bs = test_size, 
+                #                                 S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
+                #                                 verbose=False)
+                # train_res[m]['loss'].append(res['loss'])
+
+                test_predictions, val_predictions = nuqls.regression_parallel(net = map_net, train = train_dataset, test=test_dataset, ood_test=validation_dataset, 
+                                                        train_bs = batch_size, test_bs = batch_size, 
+                                                    S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9)
+                
+                train_res[m]['loss'].append(0.0)
+
+            else:
+                # Train model for gamma = 1 (as reference) and get predictions
+                nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
+                                                            lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
+                max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
+                                                            progress_bar=args.progress_bar)
+                val_predictions = nuqls_model.test_linear(validation_dataset)
+
+                train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
+
+                test_predictions = nuqls_model.test_linear(test_dataset)
+
+            for k in range(k_scale):
+                left_third = left_scale + (right_scale - left_scale) / 3
+                right_third = right_scale - (right_scale - left_scale) / 3
+
+                # Left ECE
+                scaled_nuqls_predictions = val_predictions * left_third
+                obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
+                left_ece = torch.mean(torch.square(obs_map - predicted))
+
+                # Right ECE
+                scaled_nuqls_predictions = val_predictions * right_third
+                obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
+                right_ece = torch.mean(torch.square(obs_map - predicted))
+
+                if left_ece > right_ece:
+                    left_scale = left_third
                 else:
+                    right_scale = right_third
+
+                scale = (left_scale + right_scale) / 2
+
+                # Print info
+                if args.verbose:
+                    print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
+
+                if abs(right_scale - left_scale) <= 1e-2:
                     break
+                
+            # Scale test predictions
+            nuqls_predictions = test_predictions*scale
 
-            nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = args.nuqls_S, epochs=args.nuqls_epoch, lr=args.nuqls_lr, bs=train_size, bs_test=test_size,init_scale=best_scale)
-            nuqls_predictions, max_l2_loss, norm_resid = nuqls_model.method(test_dataset,mu=0.9,weight_decay=0,my=0,sy=1,verbose=False)
+            mean_pred = test_predictions.mean(1)
+            var_pred = nuqls_predictions.var(1) # We only find the gamma term in the variance
 
-            mean_pred = nuqls_predictions.mean(1)
+        elif m == 'NUQLS_SCALE_S_MAP':
+
+            left_scale, right_scale, k_scale = 0.1, 100, 20
+
+            if args.dataset=='song':
+                # Train model for gamma = 0.1 (as reference) and get predictions
+                val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
+                                                regression= 'True', train_bs = train_size, test_bs = test_size, 
+                                                S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
+                                                verbose=False) # Shape of predictions is S x N x 1
+                val_predictions, test_predictions = val_predictions.squeeze(2).T, test_predictions.squeeze(2).T
+                train_res[m]['loss'].append(res['loss'])
+
+            else:
+                # Train model for gamma = 1 (as reference) and get predictions
+                nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
+                                                            lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
+                max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
+                                                            progress_bar=args.progress_bar)
+                val_predictions = nuqls_model.test_linear(validation_dataset)
+                print(val_predictions.shape)
+
+                train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
+
+                test_predictions = nuqls_model.test_linear(test_dataset)
+
+            for k in range(k_scale):
+                left_third = left_scale + (right_scale - left_scale) / 3
+                right_third = right_scale - (right_scale - left_scale) / 3
+
+                # Left ECE
+                scaled_nuqls_predictions = val_predictions * left_third
+                obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
+                left_ece = torch.mean(torch.square(obs_map - predicted))
+
+                # Right ECE
+                scaled_nuqls_predictions = val_predictions * right_third
+                obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
+                right_ece = torch.mean(torch.square(obs_map - predicted))
+
+                if left_ece > right_ece:
+                    left_scale = left_third
+                else:
+                    right_scale = right_third
+
+                scale = (left_scale + right_scale) / 2
+
+                # Print info
+                if args.verbose:
+                    print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
+
+                if abs(right_scale - left_scale) <= 1e-2:
+                    break
+            
+            # Scale test predictions by best scale
+            nuqls_predictions = test_predictions*scale
+            mean_pred = map_test_pred
             var_pred = nuqls_predictions.var(1)
-
-            train_res['NUQLs']['loss'].append(max_l2_loss.detach().cpu().item())
 
         elif m == 'DE':
             model_list = []
@@ -334,10 +312,14 @@ for ei in tqdm(range(args.n_experiment)):
             sched_list = []
 
             for i in range(S):
-                model_list.append(EnsembleNetwork().to(device=device,dtype=torch.float64))
-                model_list[i].apply(weights_init)
-                opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = lr, weight_decay = weight_decay))
-                sched_list.append(torch.optim.lr_scheduler.PolynomialLR(opt_list[i], total_iters=de_epochs*10, power=0.5))
+                model_list.append(utility.EnsembleNetwork(hidden_sizes,input_start,input_dim,args.activation).to(device=device,dtype=torch.float64))
+                model_list[i].apply(utility.weights_init)
+                if args.dataset=='yacht' or args.dataset=='kin8nm':
+                    opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
+                    sched_list.append(torch.optim.lr_scheduler.CosineAnnealingLR(opt_list[i], T_max=de_epochs))                  
+                else:
+                    opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
+                    sched_list.append(None)
 
             de_train_total = 0
             de_test_total = 0
@@ -345,8 +327,15 @@ for ei in tqdm(range(args.n_experiment)):
             de_t1 = time.time()
             for i in tqdm(range(S)):
                 for epoch in range(de_epochs):
-                    de_train_loss = train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=None)
-                    de_test_loss, de_test_mse = test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
+                    de_train_loss = utility.train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=sched_list[i])
+                    de_test_loss, de_test_mse = utility.test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
+                    if args.extra_verbose and epoch % 10 == 0:
+                        print("Epoch {} of {}".format(epoch,de_epochs))
+                        print("Training loss = {:.4f}".format(de_train_loss))
+                        print("Test loss = {:.4f}".format(de_test_loss))
+                        print("Test mse = {:.4f}".format(de_test_mse))
+                        print("\n -------------------------------------")
+                # import sys; sys.exit(0)
                 de_train_total += de_train_loss
                 de_test_total += de_test_loss
                 de_mse_total += de_test_mse
@@ -354,7 +343,7 @@ for ei in tqdm(range(args.n_experiment)):
             de_test_total /= S
             de_mse_total /= S
 
-            train_res['DE']['loss'].append(de_train_total)
+            train_res[m]['loss'].append(de_train_total)
 
             ensemble_het_mu = torch.empty((S,test_size))
             ensemble_het_var = torch.empty((S,test_size))
@@ -372,14 +361,22 @@ for ei in tqdm(range(args.n_experiment)):
             var_pred = torch.mean(ensemble_het_var + torch.square(ensemble_het_mu), dim=0) - torch.square(mean_pred)
 
         elif m == 'LLA':
+            if args.dataset == 'protein':
+                cov_type = 'kron'
+            elif args.dataset == 'song':
+                cov_type = 'diag'
+            else:
+                cov_type = 'full'
+
             full_train_loader = DataLoader(train_dataset, batch_size=train_size, shuffle=False)
             full_test_loader = DataLoader(test_dataset, batch_size=test_size, shuffle=False)
-            X_test, Y_test = next(iter(full_test_loader))
-            X_test = X_test.to(device)
 
             full_val_loader = DataLoader(validation_dataset,batch_size=len(validation_dataset),shuffle=False)
             X_val, Y_val = next(iter(full_val_loader))
             X_val, Y_val = X_val.to(device), Y_val.to(device)
+
+            lla_val_loader = DataLoader(validation_dataset, batch_size=batch_size)
+            lla_test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
             best_sigma = 1e-17
             best_ll = -1e17
@@ -387,11 +384,16 @@ for ei in tqdm(range(args.n_experiment)):
             for sigma in sigmas:
                 lh = GaussianLh(sigma_noise=sigma.to(device))
                 new_ll = lh.log_likelihood(Y_val.to(device),map_net(X_val))
+
+                # Print info
+                if args.verbose:
+                    print(f'\nNOISE {sigma:.3}:: LLA: {new_ll:.4f}') 
+
                 if new_ll > best_ll:
                     best_ll = new_ll
                     best_sigma = sigma
-                    # print("New best ll = {}".format(best_ll))
-                    # print("New best sigma = {}".format(best_sigma))
+                    if args.verbose:
+                        print('New best!')
             lh = GaussianLh(sigma_noise=best_sigma)
 
             best_prior = 1e-17
@@ -402,24 +404,86 @@ for ei in tqdm(range(args.n_experiment)):
             for s,prior in enumerate(priors):
 
                 lap = Laplace(map_net, float(prior), lh)
-                lap.infer(full_train_loader, cov_type='full', dampen_kron=True)
-                new_lla_mu, new_lla_var = lap.predictive_samples_glm(X_val, n_samples=1000)
-                new_lla_mu, new_lla_var = new_lla_mu.detach(), new_lla_var.detach()
+                lap.infer(train_loader, cov_type=cov_type, dampen_kron=False)
+                
+                new_lla_mu = []
+                new_lla_var = []
+                for x,_ in lla_val_loader:
+                    mu, var = lap.predictive_samples_glm(x.to(device), n_samples=1000)
+                    new_lla_mu.append(mu.detach())
+                    new_lla_var.append(var.detach())
+                new_lla_mu = torch.cat(new_lla_mu,dim=0)
+                new_lla_var = torch.cat(new_lla_var,dim=0)
 
-                new_observed_conf_lla, new_predicted_conf = calibration_curve_r(calibration_test_loader_val,new_lla_mu,new_lla_var,11)
+                new_observed_conf_lla, new_predicted_conf = utility.calibration_curve_r(val_y,new_lla_mu,new_lla_var,11)
                 new_ece_lla = torch.mean(torch.square(new_observed_conf_lla - new_predicted_conf))
+
+                # Print info
+                if args.verbose:
+                    print(f'\nSCALE {prior:.3}:: LLA: {new_ece_lla:.1%}') 
+                
                 if new_ece_lla < best_ece:
                     best_ece = new_ece_lla
                     lla_mu = new_lla_mu
                     lla_var = new_lla_var
                     best_prior = prior
-                    # print("New best ece = {}".format(new_ece_lla))
-                    # print("New best prior = {}".format(best_prior))
+                    if args.verbose:
+                        print("New best!")
 
             lap = Laplace(map_net, float(best_prior), lh)
-            lap.infer(full_train_loader, cov_type='full', dampen_kron=True)
-            lla_mu, lla_var = lap.predictive_samples_glm(X_test, n_samples=1000)
-            mean_pred, var_pred = lla_mu.detach(), lla_var.detach()
+            lap.infer(train_loader, cov_type=cov_type, dampen_kron=False)
+
+            lla_mu = []
+            lla_var = []
+            for x,_ in lla_test_loader:
+                mu, var = lap.predictive_samples_glm(x.to(device), n_samples=1000)
+                lla_mu.append(mu.detach())
+                lla_var.append(var.detach())
+            mean_pred = torch.cat(lla_mu,dim=0)
+            var_pred = torch.cat(lla_var,dim=0)
+
+        elif m=='SWAG':
+            wds = torch.tensor([0,5e-3,1e-5])
+            best_ece = 1.01
+            for wd in wds:
+                ## SWAG
+                swag_method = swag.SWAG_R(map_net,epochs = epochs, lr = lr, cov_mat = True,
+                                            max_num_models=10)
+                swag_method.train_swag(train_loader=train_loader, weight_decay=wd)
+
+                T = 1000
+                swag_pred = []
+                for t in range(T):
+                    swag_method.sample(cov=True)
+                    pred_i = util.evaluate_batch(dataset=validation_dataset, model=swag_method, batch_size=batch_size)
+                    swag_pred.append(pred_i.reshape(1,-1))
+                swag_pred = torch.cat(swag_pred)
+                mean_pred = swag_pred.mean(axis=0)
+                var_pred = swag_pred.var(axis=0)
+
+                conf, predicted = utility.calibration_curve_r(val_y,mean_pred,var_pred,11)
+                new_ece_swag = torch.mean(torch.square(conf - predicted))
+
+                if new_ece_swag < best_ece:
+                    best_ece = new_ece_swag
+                    best_wd = wd
+                    if args.verbose:
+                        print("New best!")
+
+            ## SWAG
+            swag_method = swag.SWAG_R(map_net,epochs = epochs, lr = lr, cov_mat = True,
+                                        max_num_models=10)
+            swag_method.train_swag(train_loader=train_loader, weight_decay=best_wd)
+
+            T = 1000
+            swag_pred = []
+            for t in range(T):
+                swag_method.sample(cov=True)
+                pred_i = util.evaluate_batch(dataset=test_dataset, model=swag_method, batch_size=batch_size)
+                swag_pred.append(pred_i.reshape(1,-1))
+            swag_pred = torch.cat(swag_pred)
+            mean_pred = swag_pred.mean(axis=0)
+            var_pred = swag_pred.var(axis=0)
 
         print(f"\n--- Method {m} ---")
         if m in train_res:
@@ -434,13 +498,15 @@ for ei in tqdm(range(args.n_experiment)):
 
             test_res[m]['nll'].append(nll(mean_pred.detach().cpu().reshape(-1,1),test_y.reshape(-1,1),var_pred.detach().cpu().reshape(-1,1)).detach().cpu().item())
 
-            observed_conf, predicted_conf = calibration_curve_r(calibration_test_loader,mean_pred,var_pred,11)
+            observed_conf, predicted_conf = utility.calibration_curve_r(test_y,mean_pred,var_pred,11)
             test_res[m]['ece'].append(torch.mean(torch.square(observed_conf - predicted_conf)).detach().cpu().item())
 
             
             print("\nTest Prediction:")
-            t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
-            print(f"Time h:m:s: {t}")
+            # t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
+            # print(f"Time h:m:s: {t}")
+            t = test_res[m]['time'][ei]
+            print(f'Time(s): {t:.3f}')
             print(f"RMSE.: {test_res[m]['rmse'][ei]:.3f}; NLL: {test_res[m]['nll'][ei]:.3f}; ECE: {test_res[m]['ece'][ei]:.1%}")
         print('\n')
 
@@ -451,20 +517,20 @@ if not os.path.exists(res_dir):
     os.makedirs(res_dir)
 
 results = open(f"{res_dir}/{args.dataset}.txt",'w')
-
 results.write("Training, Val, Test points = {}, {}, {}\n".format(train_size, validation_size, test_size))
 results.write(f"Number of hidden units, parameters = {hidden_sizes}, {map_p}\n")
+results.write(f'n_experiment = {n_experiment}\n')
 
 results.write("\n--- MAP Training Details --- \n")
-results.write("training: epochs, de_epochs, lr, weight decay, batch size = {}, {}, {}, {}\n".format(
+results.write("training: epochs, de_epochs, lr, weight decay, batch size = {}, {}, {}, {}, {}\n".format(
     epochs, de_epochs, lr, weight_decay, batch_size
 ))
 
-results.write("\n --- NUQLs Details --- \n")
-results.write(f"epochs: {args.nuqls_epoch}; S: {args.nuqls_S}; lr: {args.nuqls_lr}; epochs: {args.nuqls_epoch}\n")
+results.write("\n --- NUQLS Details --- \n")
+results.write(f"epochs: {nuqls_epoch}; S: {nuqls_S}; lr: {nuqls_lr}\n")
 
 for m in methods:
-    if args.n_experiment > 1:
+    if n_experiment > 1:
         results.write(f"\n--- Method {m} ---\n")
         if m in train_res:
             results.write("\n - Train Results: - \n")
@@ -473,11 +539,11 @@ for m in methods:
         if m != 'MAP':
             results.write("\n - Test Prediction: - \n")
             for k in test_res[m].keys():
-                if k == 'time':
-                    t = time.strftime("%H:%M:%S", time.gmtime(np.mean(test_res[m][k])))
-                    results.write(f"{k}: {t}\n")
-                else:
-                    results.write(f"{k}: {np.mean(test_res[m][k]):.3f} +- {np.std(test_res[m][k]):.3f} \n")
+                # if k == 'time':
+                #     t = time.strftime("%H:%M:%S", time.gmtime(np.mean(test_res[m][k])))
+                #     results.write(f"{k}: {t}\n")
+                # else:
+                results.write(f"{k}: {np.mean(test_res[m][k]):.3f} +- {np.std(test_res[m][k]):.3f} \n")
     else:
         results.write(f"\n--- Method {m} ---\n")
         if m in train_res:
@@ -487,10 +553,12 @@ for m in methods:
         if m != 'MAP':
             results.write("\n - Test Prediction: - \n")
             for k in test_res[m].keys():
-                if k == 'time':
-                    t = time.strftime("%H:%M:%S", time.gmtime(test_res[m][k][0]))
-                    results.write(f"{k}: {t}\n")
-                else:
-                    print(f'list = {test_res[m][k][0]}')
-                    results.write(f"{k}: {test_res[m][k][0]:.3f}\n")
+                # if k == 'time':
+                #     t = time.strftime("%H:%M:%S", time.gmtime(test_res[m][k][0]))
+                #     results.write(f"{k}: {t}\n")
+                # else:
+                results.write(f"{k}: {test_res[m][k][0]:.3f}\n")
 results.close()
+
+print('results created')
+

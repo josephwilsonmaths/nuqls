@@ -100,6 +100,7 @@ class SWAG(torch.nn.Module):
             # print(np,i)
 
     def forward(self, x):
+        # self.swag_net.to(device)
         return self.swag_net(x)
         
     def train_swag(self,train_dataloader, progress_bar=True):
@@ -151,6 +152,7 @@ class SWAG(torch.nn.Module):
             self.sample_fullrank(scale, cov)
         else:
             self.sample_blockwise(scale, cov)
+        self.swag_net.to(device)
 
     def sample_blockwise(self, scale, cov):
         for module, name in self.params:
@@ -247,7 +249,7 @@ class SWAG_R(torch.nn.Module):
         self.var_clamp = var_clamp
 
         self.loss_fn = torch.nn.MSELoss()
-        self.optimizer = torch.optim.Adam(self.swag_net.parameters(), lr=self.lr)
+        # self.optimizer = torch.optim.Adam(self.swag_net.parameters(), lr=self.lr)
 
         self.swag_net.apply(
                     lambda module: swag_parameters(
@@ -258,25 +260,29 @@ class SWAG_R(torch.nn.Module):
     def print_layers(self):
         print("\n=== Printing parameters of self.swag_net ===")
         for keys in self.swag_net.state_dict().keys():
-                print(self.swag_net.state_dict()[keys])
+                print(f'{keys} : {self.swag_net.state_dict()[keys].device}')
 
     def forward(self, x):
         return self.swag_net(x)
     
-    def train_loop(self,x,y):
+    def train_loop(self,train_loader,optimizer):
         # Compute prediction error
-        pred = self.swag_net(x)
-        loss = self.loss_fn(pred, y)
+        for x,y in train_loader:
+            x, y = x.to(device), y.to(device)
+            pred = self.swag_net(x)
+            loss = self.loss_fn(pred, y)
 
-        # Backpropagation
-        loss.backward()
+            # Backpropagation
+            loss.backward()
 
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
         
-    def train_swag(self,x,y):
+    def train_swag(self,train_loader, weight_decay):
+        optimizer = torch.optim.SGD(self.swag_net.parameters(), lr=self.lr, momentum=0, weight_decay=weight_decay)
+        # optimizer = torch.optim.Adam(self.swag_net.parameters(), lr=self.lr, weight_decay=weight_decay)
         for _ in range(self.epochs):
-            self.train_loop(x,y)
+            self.train_loop(train_loader,optimizer)
             self.collect_model()
         
     def collect_model(self):
@@ -344,6 +350,8 @@ class SWAG_R(torch.nn.Module):
 
             module.__setattr__(name, torch.nn.parameter.Parameter(w))
 
+        self.swag_net.to(device)
+
     def sample_fullrank(self, scale, cov):
         scale_sqrt = scale ** 0.5
 
@@ -395,6 +403,8 @@ class SWAG_R(torch.nn.Module):
 
         for (module, name), sample in zip(self.params, samples_list):
             module.__setattr__(name, torch.nn.parameter.Parameter(sample))
+
+        self.swag_net.to(device)
 
 def train_loop(dataloader, model, loss_fn, optimizer, scheduler):
         model.train()

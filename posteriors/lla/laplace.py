@@ -39,7 +39,9 @@ class Laplace:
             for X, y in train_loader:
                 X, y = X.to(self.device), y.reshape(-1,1).to(self.device)
                 Js, Hess, rs, f = GGN(self.model, self.likelihood, X, y, ret_f=True)
+                # Js, Hess, f = Js.detach(), Hess.detach(), f.detach()
                 precision += torch.einsum('mpk,mkl,mql->pq', Js, Hess, Js)
+            # print(f'J = {Js.requires_grad}, Hess = {Hess.requires_grad}, precision = {precision.requires_grad}')
             Chol = torch.linalg.cholesky(precision)
             Sigma = torch.cholesky_inverse(Chol, upper=False)
             self.Sigma_chol = torch.linalg.cholesky(Sigma, upper=False)
