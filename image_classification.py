@@ -28,10 +28,11 @@ import argparse
 import warnings
 from scipy.cluster.vq import kmeans2
 import configparser
+import posteriors.nuqlsPosterior.nuqls as nqls
 
 import utils.training
 
-warnings.filterwarnings('ignore') 
+warnings.filterwarnings('ignore')
 
 torch.set_default_dtype(torch.float64)
 
@@ -43,6 +44,7 @@ device = (
     else "cpu"
 )
 print(f"\n Using {device} device")
+print(f"CUDA version: {torch.version.cuda}")
 
 parser = argparse.ArgumentParser(description='Classification Experiment')
 parser.add_argument('--dataset', default='mnist', type=str, help='dataset')
@@ -147,6 +149,50 @@ elif args.dataset=='cifar10':
     n_output = 10
     n_channels = 3
 
+elif args.dataset=='svhn':
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4376821, 0.4437697, 0.47280442), (0.19803012, 0.20101562, 0.19703614)),
+    ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4376821, 0.4437697, 0.47280442), (0.19803012, 0.20101562, 0.19703614)),
+    ])
+
+    training_data = datasets.SVHN(
+        root="data/SVHN",
+        split='train',
+        download=True,
+        transform=transform_train
+    )
+
+    test_data = datasets.SVHN(
+        root="data/SVHN",
+        split='test',
+        download=True,
+        transform=transform_test
+    )
+
+    transform_test_cifar = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    ood_test_data = datasets.CIFAR10(
+        root="data/CIFAR10",
+        train=False,
+        download=True,
+        transform=transform_test_cifar
+    ) 
+
+    # train_data, val_data = torch.utils.data.random_split(training_data,[50000,10000]) -> results in performance drop for CIFAR
+    val_data = test_data
+    n_output = 10
+    n_channels = 3
+
 elif args.dataset=='cifar100':
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -187,8 +233,8 @@ elif args.dataset=='cifar100':
     n_channels = 3
 
 if args.subsample:
-    N_TRAIN = 1000
-    N_TEST = 11
+    N_TRAIN = 5000
+    N_TEST = 100
     training_data = torch.utils.data.Subset(training_data,range(N_TRAIN))
     test_data = torch.utils.data.Subset(test_data,range(N_TEST))
     val_data = torch.utils.data.Subset(val_data,range(N_TEST))
@@ -233,11 +279,13 @@ loss_fn = nn.CrossEntropyLoss()
 
 # Setup metrics
 if args.lla_incl:
-    methods = ['MAP','NUQLS']
-    train_methods = ['MAP','NUQLS']
+    methods = ['MAP','LLA']
+    train_methods = ['MAP']
 else:
-    methods = ['MAP','NUQLS','DE','SWAG','MC','VaLLA','LLA']
-    train_methods = ['MAP','NUQLS','DE','MC']
+    # methods = ['MAP','NUQLS','DE','SWAG','MC']
+    methods = ['MAP','NUQLS_TEST']
+    # methods = ['MAP','SWAG','MC']
+    train_methods = ['MAP','NUQLS_TEST','NUQLS','DE','MC']
 test_res = {}
 train_res = {}
 for m in methods:
@@ -249,6 +297,7 @@ for m in methods:
                   'ece': [],
                   'oodauc': [],
                   'aucroc': [],
+                  'varroc': [],
                   'time': []}
 
 prob_var_dict = {}
@@ -274,6 +323,8 @@ else:
 
 if not os.path.exists(res_dir):
     os.makedirs(res_dir)
+
+print(f'Using {args.dataset} dataset, num train points = {len(training_data)}')
 
 for ei in tqdm.trange(n_experiment):
     print("\n--- experiment {} ---".format(ei))
@@ -329,6 +380,10 @@ for ei in tqdm.trange(n_experiment):
                     elif args.model == 'resnet50':
                         optimizer = torch.optim.SGD(map_net.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
                         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
+                elif args.dataset == 'svhn':
+                    if args.model == 'resnet50':
+                        optimizer = torch.optim.SGD(map_net.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
                 elif args.dataset == 'cifar100':
                     optimizer = torch.optim.SGD(map_net.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
                     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
@@ -347,6 +402,29 @@ for ei in tqdm.trange(n_experiment):
             id_mean = torch.nn.functional.softmax(id_map_logits,dim=1)
             ood_mean = torch.nn.functional.softmax(ood_map_logits,dim=1)
 
+        elif m == 'NUQLS_TEST':
+            nuqls_posterior = nqls.Nuqls(map_net, task='classification')
+            loss,acc = nuqls_posterior.train(train=training_data, 
+                                train_bs=nuqls_bs, 
+                                n_output=n_output,
+                                S=nuqls_S,
+                                scale=nuqls_gamma, 
+                                lr=nuqls_lr, 
+                                epochs=nuqls_epoch, 
+                                mu=0.9,
+                                verbose=args.verbose)
+            train_res[m]['nll'].append(loss)
+            train_res[m]['acc'].append(acc)
+
+            id_logits = nuqls_posterior.test(test_data, test_bs=nuqls_bs) 
+            id_predictions = id_logits.softmax(dim=2)
+            ood_logits = nuqls_posterior.test(ood_test_data, test_bs=nuqls_bs)
+            ood_predictions = ood_logits.softmax(dim=2)
+
+            id_mean = id_predictions.mean(dim=0); id_logit_var = id_logits.var(0)
+            ood_mean = ood_predictions.mean(dim=0); ood_logit_var = ood_logits.var(0)
+            
+            
         elif m == 'NUQLS':
             nuql = nuqls.classification_parallel_i(map_net)
             loss, acc = nuql.train(train=training_data, train_bs = nuqls_bs, n_output=n_output, S = nuqls_S, scale=nuqls_gamma, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, verbose=args.verbose)
@@ -627,8 +705,8 @@ for ei in tqdm.trange(n_experiment):
             swag_net.train_swag(train_dataloader=train_dataloader,progress_bar=args.progress)
 
             T = 100
-            id_mean, _, id_predictions = pu.swag_sampler(dataset=test_data,model=swag_net,T=T,n_output=n_output,bs=bs) # id_predictions -> S x N x C
-            ood_mean, _, ood_predictions = pu.swag_sampler(dataset=ood_test_data,model=swag_net,T=T,n_output=n_output,bs=bs) # ood_predictions -> S x N x C
+            id_mean, _, id_predictions = pu.swag_sampler(dataset=test_data,model=swag_net,T=T,n_output=n_output,bs=1000) # id_predictions -> S x N x C
+            ood_mean, _, ood_predictions = pu.swag_sampler(dataset=ood_test_data,model=swag_net,T=T,n_output=n_output,bs=1000) # ood_predictions -> S x N x C
         
         elif m == 'MC':
             p = 0.1
@@ -678,9 +756,8 @@ for ei in tqdm.trange(n_experiment):
         test_res[m]['aucroc'].append(aucroc)
 
         if m != 'MAP':
-            varroc = metrics.aucroc(id_logit_var.sum(1).detach().cpu(), ood_logit_var.sum(1).detach().cpu())
-            varroc_inv = metrics.aucroc(ood_logit_var.sum(1).detach().cpu(), id_logit_var.sum(1).detach().cpu())
-        
+            varroc = metrics.aucroc(ood_logit_var.sum(1).detach().cpu(), id_logit_var.sum(1).detach().cpu())
+            test_res[m]['varroc'].append(varroc)
 
         ### print (train and) test prediction results
         print(f"\n--- Method {m} ---")
@@ -691,9 +768,10 @@ for ei in tqdm.trange(n_experiment):
         t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
         print(f"Time h:m:s: {t}")
         print(f"Acc.: {test_res[m]['acc'][ei]:.1%}; ECE: {test_res[m]['ece'][ei]:.1%}; NLL: {test_res[m]['nll'][ei]:.3}")
-        print(f"OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%}\n")
-        if m != 'MAP':
-            print(f"VARROC: {varroc:.1%}; VARROC-INV: {varroc_inv:.1%}\n")
+        if m == 'MAP':
+            print(f"OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%}\n")
+        else:
+            print(f"OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%}; VARROC: {test_res[m]['varroc'][ei]:.1%}\n") 
 
         if m != 'MAP':
             if args.save_var:
@@ -701,7 +779,12 @@ for ei in tqdm.trange(n_experiment):
 
     # Save predictions, variances for plotting
     if args.save_var:
+        prob_var_dict = metrics.add_baseline(prob_var_dict,test_data,ood_test_data)
         torch.save(prob_var_dict,res_dir + f"prob_var_dict_{ei}.pt")
+
+        metrics.plot_vmsp(prob_dict=prob_var_dict,
+                          title=f'{args.dataset} {args.model}',
+                          save_fig=res_dir + f"vmsp_plot.pdf")
 
 ## Record results
 res_text = res_dir + f"result.txt"
@@ -709,7 +792,7 @@ results = open(res_text,'w')
 torch.save(train_res,res_dir + f'train_res.pt')
 torch.save(test_res,res_dir + f'test_res.pt')
 
-percentage_metrics = ['acc','ece','oodauc','aucroc']
+percentage_metrics = ['acc','ece','oodauc','aucroc','varroc']
 
 results.write(" --- MAP Training Details --- \n")
 results.write(f"epochs: {epochs}; M: {S}; lr: {lr}; weight_decay: {wd}\n")
@@ -732,6 +815,8 @@ for m in methods:
             if k == 'time':
                 t = time.strftime("%H:%M:%S", time.gmtime(np.mean(test_res[m][k])))
                 results.write(f"{k}: {t}\n")
+            elif k == 'varroc' and m == 'MAP':
+                continue
             elif k in percentage_metrics:
                 results.write(f"{k}: {np.mean(test_res[m][k]):.1%} +- {np.std(test_res[m][k]):.1%} \n")
             else:
@@ -750,6 +835,8 @@ for m in methods:
             if k == 'time':
                 t = time.strftime("%H:%M:%S", time.gmtime(test_res[m][k][0]))
                 results.write(f"{k}: {t}\n")
+            elif k == 'varroc' and m == 'MAP':
+                continue
             elif k in percentage_metrics:
                 results.write(f"{k}: {test_res[m][k][0]:.1%}\n")
             else:

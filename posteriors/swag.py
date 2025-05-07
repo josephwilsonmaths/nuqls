@@ -71,7 +71,7 @@ def unflatten_like(vector, likeTensorList):
 
 class SWAG(torch.nn.Module):
 
-    def __init__(self,net,epochs=50,lr=1e-3,cov_mat=True,max_num_models=0,var_clamp=1e-30):
+    def __init__(self,net,epochs=50,lr=1e-3,cov_mat=True,max_num_models=0,var_clamp=1e-30,wd=0):
         super(SWAG,self).__init__()
         self.swag_net = copy.deepcopy(net)
 
@@ -80,12 +80,13 @@ class SWAG(torch.nn.Module):
 
         self.epochs = epochs
         self.lr = lr
+        self.wd = wd
         self.cov_mat = cov_mat
         self.max_num_models = max_num_models
         self.var_clamp = var_clamp
 
         self.loss_fn = torch.nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.SGD(self.swag_net.parameters(), lr=self.lr)
+        self.optimizer = torch.optim.SGD(self.swag_net.parameters(), lr=self.lr, weight_decay=self.wd)
 
         self.swag_net.apply(
                     lambda module: swag_parameters(
@@ -279,8 +280,8 @@ class SWAG_R(torch.nn.Module):
             optimizer.zero_grad()
         
     def train_swag(self,train_loader, weight_decay):
-        optimizer = torch.optim.SGD(self.swag_net.parameters(), lr=self.lr, momentum=0, weight_decay=weight_decay)
-        # optimizer = torch.optim.Adam(self.swag_net.parameters(), lr=self.lr, weight_decay=weight_decay)
+        # optimizer = torch.optim.SGD(self.swag_net.parameters(), lr=self.lr, momentum=0.9, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(self.swag_net.parameters(), lr=self.lr, weight_decay=weight_decay)
         for _ in range(self.epochs):
             self.train_loop(train_loader,optimizer)
             self.collect_model()

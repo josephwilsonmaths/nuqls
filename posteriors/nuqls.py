@@ -447,8 +447,6 @@ class classification_parallel_i(object):
     def __init__(self, net):
         self.net = net
 
-    
-
     def train(self, train, train_bs=50, n_output = 10, scale=1, S=10, epochs=100, lr=1e-3, mu=0.9, verbose=False, progress_bar=True):
         
         train_loader = DataLoader(train,train_bs,num_workers=0, pin_memory=False, pin_memory_device=device)
@@ -489,10 +487,10 @@ class classification_parallel_i(object):
         
         with torch.no_grad():
             for epoch in pbar:
-                loss = 0
+                loss = torch.zeros((S), device='cpu')
+                acc = torch.zeros((S), device='cpu')
                 i = 0
-                for j,(x,y) in enumerate(train_loader):
-                    print(f'{j}: {len(train) / train_bs}')
+                for x,y in train_loader:
                     x, y = x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
                     f_nlin = self.net(x)
                     proj = torch.vmap(jvp_first, (1,None,None))((theta_S),params,x).permute(1,2,0)
@@ -505,21 +503,34 @@ class classification_parallel_i(object):
                     vjp = torch.cat(vjp,dim=1).detach()
                     g = (vjp.T / x.shape[0]).detach()
 
+                    # if epoch < 6:
+                    #     lr_sc = lr
+                    # else:
+                    #     lr_sc = lr / 10
+
                     if epoch == 0:
                         bt = g
                     else:
                         bt = mu*bt + g
                     theta_S -= lr*bt
 
-                    l = (-1 / x.shape[0] * torch.sum((ybar.unsqueeze(2) * torch.log(Mubar)),dim=(0,1))).detach()
+                    l = (-1 / x.shape[0] * torch.sum((ybar.unsqueeze(2) * torch.log(Mubar)),dim=(0,1))).detach().cpu()
                     loss += l
 
+                    a = (f_lin.argmax(1) == y.unsqueeze(1).repeat(1,S)).type(torch.float).sum(0).detach().cpu()  # f_lin: N x C x S, y: N
+                    acc += a
+
+
                 loss /= len(train_loader)
+                acc /= len(train)
                 if verbose:        
                     if epoch % 1 == 0:
                         print("\n-----------------")
                         print("Epoch {} of {}".format(epoch+1,epochs))
+                        print("min ce loss = {:.4}".format(loss.min()))
                         print("max ce loss = {:.4}".format(loss.max()))
+                        print("min acc = {:.4}".format(acc.min()))
+                        print("max acc = {:.4}".format(acc.max()))
                         print("Residual of normal equation l2 = {:.4}".format(torch.mean(torch.square(g))))
                         print(f'Max Mem used = {(1e-9*torch.cuda.max_memory_allocated()):.3} gb')
         
@@ -527,10 +538,7 @@ class classification_parallel_i(object):
             print('Posterior samples computed!')
         self.theta_S = theta_S
 
-        if epochs == 0:
-            return 0.0
-
-        return loss.max().item()
+        return loss.max().item(), acc.min().item()
     
     def test(self, test, test_bs=50):
         params = {k: v.detach() for k, v in self.net.named_parameters()}
@@ -549,8 +557,7 @@ class classification_parallel_i(object):
         
         # Concatenate predictions
         pred_s = []
-        for i,(x,y) in enumerate(test_loader):
-            print(f'{i}: {len(test) / test_bs}')
+        for x,y in test_loader:
             x, y = x.to(device), y.to(device)
             f_nlin = self.net(x)
             proj = torch.vmap(jvp_first, (1,None,None))((self.theta_S),params,x).permute(1,2,0)

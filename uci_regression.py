@@ -18,6 +18,10 @@ import json
 import posteriors.util as util
 import posteriors.swag as swag
 import utils.regression_util as utility
+import posteriors.bde as bde
+from functorch import make_functional
+from torch.func import vmap, jacrev
+import posteriors.nuqlsPosterior.nuqls as nqls
 
 torch.set_default_dtype(torch.float64)
 
@@ -101,11 +105,12 @@ if normalize:
     sy = np.where(sy==0,1,sy)
 
 # Setup metrics
-methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG'] 
+# methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG'] 
+methods = ['MAP','NUQLS']
 # methods = ['MAP','NUQLS','NUQLS_MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','NUQLS_SCALE_T','NUQLS_SCALE_T_MAP','DE','LLA','SWAG']
 # methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG']
 # methods = ['MAP','DE']
-train_methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE']
+train_methods = ['MAP','NUQLS','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE']
 test_res = {}
 train_res = {}
 for m in methods:
@@ -182,6 +187,21 @@ for ei in tqdm(range(n_experiment)):
                 x = x.to(device)
                 map_pred.append(map_net(x))
             map_val_pred = torch.cat(map_pred)
+
+        elif m == 'NUQLS':
+            nuqls_posterior = nqls.Nuqls(map_net, task='regression', full_dataset=False)
+            res = nuqls_posterior.train(train=train_dataset, 
+                                train_bs=batch_size, 
+                                S = nuqls_S, 
+                                scale=0.01, 
+                                lr=nuqls_lr, 
+                                epochs=nuqls_epoch, 
+                                mu=0.9,
+                                verbose=True)
+            train_res[m]['loss'].append(res)
+
+            nuqls_posterior.HyperparameterTuning(validation_dataset, left=0.1, right=10, its=20, verbose=False)
+            mean_pred, var_pred = nuqls_posterior.CalibratedUncertaintyPrediction(test_dataset)
 
         elif m == 'NUQLS_SCALE_S':
 
@@ -360,6 +380,78 @@ for ei in tqdm(range(n_experiment)):
             mean_pred = torch.mean(ensemble_het_mu,dim=0)
             var_pred = torch.mean(ensemble_het_var + torch.square(ensemble_het_mu), dim=0) - torch.square(mean_pred)
 
+        elif m == 'BDE':
+
+            weight_decay = 0
+            sigma2 = 1
+
+            model_list = []
+            opt_list = []
+            sched_list = []
+
+            bde_preds = torch.empty((S,test_size))
+            bde_var = torch.empty((S,test_size))
+
+            for i in range(S):
+
+                bde_model1 = MLPS(input_size=input_dim-input_start, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
+                bde_model1.apply(bde.bde_weights_init)
+                opt = torch.optim.Adam(bde_model1.parameters(), lr = lr, weight_decay=weight_decay)
+                sched = None
+
+                ## Find theta~
+                bde_model2 = MLPS(input_size=input_dim-input_start, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
+                bde_model2.apply(bde.bde_weights_init) 
+                theta_star_k = bde.l_layer_params(bde_model2)
+
+                ## Create delta functions
+                fnet, params = make_functional(bde_model1)
+
+                def fnet_single(params, x):
+                    return fnet(params, x.unsqueeze(0)).squeeze(0)
+            
+
+                def jacobian(x):
+                    J = vmap(jacrev(fnet_single), (None, 0))(params, x.to(device))
+                    J = [j.detach().flatten(1) for j in J]
+                    J = torch.cat(J,dim=1).detach()
+                    return J
+                
+                
+                delta = lambda x : jacobian(x) @ theta_star_k
+                train_delta = []
+
+                for x,_ in train_loader:
+                    train_delta.append(delta(x))
+                train_delta = torch.cat(train_delta)
+
+                print('shapes')
+                print(train_delta.shape)
+
+                ## Save theta_k
+                theta_k = torch.nn.utils.parameters_to_vector(bde_model1.parameters()).detach().clone()
+
+                sigma2 = 1
+
+                Lambda = 1 / sigma2
+
+                ## Train ensemble member
+                print("\nTraining model {}".format(i))
+                for t in tqdm(range(epochs)):
+                    train_loss = bde.train_bde(train_loader, bde_model1, delta, theta_k, mse_loss, Lambda, opt, sched)
+                    # if t % (epochs / 10) == 0:
+                    #     print("train loss = {:.4f}".format(train_loss))
+                print("Done!")
+                print("train loss = {:.4f}".format(train_loss))
+
+                # Get predictions
+                bde_pred = []
+                for x,_ in lla_test_loader:
+                    bde_pred.append(bde_model1(x).reshape(-1) + delta(x).reshape(-1))
+
+            bre_preds = torch.cat(bde_pred,dim=0)
+            var_pred = torch.var(bde_preds,dim=0)
+        
         elif m == 'LLA':
             if args.dataset == 'protein':
                 cov_type = 'kron'
