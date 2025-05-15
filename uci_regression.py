@@ -21,7 +21,7 @@ import utils.regression_util as utility
 import posteriors.bde as bde
 from functorch import make_functional
 from torch.func import vmap, jacrev
-import posteriors.nuqlsPosterior.nuqls as nqls
+from nuqls.posterior import Nuqls
 
 torch.set_default_dtype(torch.float64)
 
@@ -189,7 +189,7 @@ for ei in tqdm(range(n_experiment)):
             map_val_pred = torch.cat(map_pred)
 
         elif m == 'NUQLS':
-            nuqls_posterior = nqls.Nuqls(map_net, task='regression', full_dataset=False)
+            nuqls_posterior = Nuqls(map_net, task='regression', full_dataset=False)
             res = nuqls_posterior.train(train=train_dataset, 
                                 train_bs=batch_size, 
                                 S = nuqls_S, 
@@ -203,128 +203,128 @@ for ei in tqdm(range(n_experiment)):
             nuqls_posterior.HyperparameterTuning(validation_dataset, left=0.1, right=10, its=20, verbose=False)
             mean_pred, var_pred = nuqls_posterior.CalibratedUncertaintyPrediction(test_dataset)
 
-        elif m == 'NUQLS_SCALE_S':
+        # elif m == 'NUQLS_SCALE_S':
 
-            left_scale, right_scale, k_scale = 0.1, 100, 20
+        #     left_scale, right_scale, k_scale = 0.1, 100, 20
 
-            if args.dataset=='song':
-                # # Train model for gamma = 0.1 (as reference) and get predictions
-                # val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
-                #                                 regression= 'True', train_bs = train_size, test_bs = test_size, 
-                #                                 S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
-                #                                 verbose=False)
-                # train_res[m]['loss'].append(res['loss'])
+        #     if args.dataset=='song':
+        #         # # Train model for gamma = 0.1 (as reference) and get predictions
+        #         # val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
+        #         #                                 regression= 'True', train_bs = train_size, test_bs = test_size, 
+        #         #                                 S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
+        #         #                                 verbose=False)
+        #         # train_res[m]['loss'].append(res['loss'])
 
-                test_predictions, val_predictions = nuqls.regression_parallel(net = map_net, train = train_dataset, test=test_dataset, ood_test=validation_dataset, 
-                                                        train_bs = batch_size, test_bs = batch_size, 
-                                                    S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9)
+        #         test_predictions, val_predictions = nuqls.regression_parallel(net = map_net, train = train_dataset, test=test_dataset, ood_test=validation_dataset, 
+        #                                                 train_bs = batch_size, test_bs = batch_size, 
+        #                                             S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9)
                 
-                train_res[m]['loss'].append(0.0)
+        #         train_res[m]['loss'].append(0.0)
 
-            else:
-                # Train model for gamma = 1 (as reference) and get predictions
-                nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
-                                                            lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
-                max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
-                                                            progress_bar=args.progress_bar)
-                val_predictions = nuqls_model.test_linear(validation_dataset)
+        #     else:
+        #         # Train model for gamma = 1 (as reference) and get predictions
+        #         nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
+        #                                                     lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
+        #         max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
+        #                                                     progress_bar=args.progress_bar)
+        #         val_predictions = nuqls_model.test_linear(validation_dataset)
 
-                train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
+        #         train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
 
-                test_predictions = nuqls_model.test_linear(test_dataset)
+        #         test_predictions = nuqls_model.test_linear(test_dataset)
 
-            for k in range(k_scale):
-                left_third = left_scale + (right_scale - left_scale) / 3
-                right_third = right_scale - (right_scale - left_scale) / 3
+        #     for k in range(k_scale):
+        #         left_third = left_scale + (right_scale - left_scale) / 3
+        #         right_third = right_scale - (right_scale - left_scale) / 3
 
-                # Left ECE
-                scaled_nuqls_predictions = val_predictions * left_third
-                obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
-                left_ece = torch.mean(torch.square(obs_map - predicted))
+        #         # Left ECE
+        #         scaled_nuqls_predictions = val_predictions * left_third
+        #         obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
+        #         left_ece = torch.mean(torch.square(obs_map - predicted))
 
-                # Right ECE
-                scaled_nuqls_predictions = val_predictions * right_third
-                obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
-                right_ece = torch.mean(torch.square(obs_map - predicted))
+        #         # Right ECE
+        #         scaled_nuqls_predictions = val_predictions * right_third
+        #         obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
+        #         right_ece = torch.mean(torch.square(obs_map - predicted))
 
-                if left_ece > right_ece:
-                    left_scale = left_third
-                else:
-                    right_scale = right_third
+        #         if left_ece > right_ece:
+        #             left_scale = left_third
+        #         else:
+        #             right_scale = right_third
 
-                scale = (left_scale + right_scale) / 2
+        #         scale = (left_scale + right_scale) / 2
 
-                # Print info
-                if args.verbose:
-                    print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
+        #         # Print info
+        #         if args.verbose:
+        #             print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
 
-                if abs(right_scale - left_scale) <= 1e-2:
-                    break
+        #         if abs(right_scale - left_scale) <= 1e-2:
+        #             break
                 
-            # Scale test predictions
-            nuqls_predictions = test_predictions*scale
+        #     # Scale test predictions
+        #     nuqls_predictions = test_predictions*scale
 
-            mean_pred = test_predictions.mean(1)
-            var_pred = nuqls_predictions.var(1) # We only find the gamma term in the variance
+        #     mean_pred = test_predictions.mean(1)
+        #     var_pred = nuqls_predictions.var(1) # We only find the gamma term in the variance
 
-        elif m == 'NUQLS_SCALE_S_MAP':
+        # elif m == 'NUQLS_SCALE_S_MAP':
 
-            left_scale, right_scale, k_scale = 0.1, 100, 20
+        #     left_scale, right_scale, k_scale = 0.1, 100, 20
 
-            if args.dataset=='song':
-                # Train model for gamma = 0.1 (as reference) and get predictions
-                val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
-                                                regression= 'True', train_bs = train_size, test_bs = test_size, 
-                                                S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
-                                                verbose=False) # Shape of predictions is S x N x 1
-                val_predictions, test_predictions = val_predictions.squeeze(2).T, test_predictions.squeeze(2).T
-                train_res[m]['loss'].append(res['loss'])
+        #     if args.dataset=='song':
+        #         # Train model for gamma = 0.1 (as reference) and get predictions
+        #         val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
+        #                                         regression= 'True', train_bs = train_size, test_bs = test_size, 
+        #                                         S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
+        #                                         verbose=False) # Shape of predictions is S x N x 1
+        #         val_predictions, test_predictions = val_predictions.squeeze(2).T, test_predictions.squeeze(2).T
+        #         train_res[m]['loss'].append(res['loss'])
 
-            else:
-                # Train model for gamma = 1 (as reference) and get predictions
-                nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
-                                                            lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
-                max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
-                                                            progress_bar=args.progress_bar)
-                val_predictions = nuqls_model.test_linear(validation_dataset)
-                print(val_predictions.shape)
+        #     else:
+        #         # Train model for gamma = 1 (as reference) and get predictions
+        #         nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
+        #                                                     lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
+        #         max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
+        #                                                     progress_bar=args.progress_bar)
+        #         val_predictions = nuqls_model.test_linear(validation_dataset)
+        #         print(val_predictions.shape)
 
-                train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
+        #         train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
 
-                test_predictions = nuqls_model.test_linear(test_dataset)
+        #         test_predictions = nuqls_model.test_linear(test_dataset)
 
-            for k in range(k_scale):
-                left_third = left_scale + (right_scale - left_scale) / 3
-                right_third = right_scale - (right_scale - left_scale) / 3
+        #     for k in range(k_scale):
+        #         left_third = left_scale + (right_scale - left_scale) / 3
+        #         right_third = right_scale - (right_scale - left_scale) / 3
 
-                # Left ECE
-                scaled_nuqls_predictions = val_predictions * left_third
-                obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
-                left_ece = torch.mean(torch.square(obs_map - predicted))
+        #         # Left ECE
+        #         scaled_nuqls_predictions = val_predictions * left_third
+        #         obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
+        #         left_ece = torch.mean(torch.square(obs_map - predicted))
 
-                # Right ECE
-                scaled_nuqls_predictions = val_predictions * right_third
-                obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
-                right_ece = torch.mean(torch.square(obs_map - predicted))
+        #         # Right ECE
+        #         scaled_nuqls_predictions = val_predictions * right_third
+        #         obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
+        #         right_ece = torch.mean(torch.square(obs_map - predicted))
 
-                if left_ece > right_ece:
-                    left_scale = left_third
-                else:
-                    right_scale = right_third
+        #         if left_ece > right_ece:
+        #             left_scale = left_third
+        #         else:
+        #             right_scale = right_third
 
-                scale = (left_scale + right_scale) / 2
+        #         scale = (left_scale + right_scale) / 2
 
-                # Print info
-                if args.verbose:
-                    print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
+        #         # Print info
+        #         if args.verbose:
+        #             print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
 
-                if abs(right_scale - left_scale) <= 1e-2:
-                    break
+        #         if abs(right_scale - left_scale) <= 1e-2:
+        #             break
             
-            # Scale test predictions by best scale
-            nuqls_predictions = test_predictions*scale
-            mean_pred = map_test_pred
-            var_pred = nuqls_predictions.var(1)
+        #     # Scale test predictions by best scale
+        #     nuqls_predictions = test_predictions*scale
+        #     mean_pred = map_test_pred
+        #     var_pred = nuqls_predictions.var(1)
 
         elif m == 'DE':
             model_list = []

@@ -28,7 +28,7 @@ import argparse
 import warnings
 from scipy.cluster.vq import kmeans2
 import configparser
-import posteriors.nuqlsPosterior.nuqls as nqls
+from nuqls.posterior import Nuqls
 
 import utils.training
 
@@ -51,6 +51,7 @@ parser.add_argument('--dataset', default='mnist', type=str, help='dataset')
 parser.add_argument('--model', default='lenet', type=str, help='model: lenet, resnet9, resnet50')
 parser.add_argument('--subsample', action='store_true', help='Use less datapoints for train and test.')
 parser.add_argument('--verbose', action='store_true',help='verbose flag for all methods')
+parser.add_argument('--extra_verbose', action='store_true',help='extra verbose flag for some methods')
 parser.add_argument('--save_var', action='store_true', help='save variances if on (memory consumption)')
 parser.add_argument('--pre_load', action='store_true', help='use pre-trained weights (must have saved state_dict() for correct model + dataset)')
 parser.add_argument('--progress', action='store_false')
@@ -233,7 +234,7 @@ elif args.dataset=='cifar100':
     n_channels = 3
 
 if args.subsample:
-    N_TRAIN = 5000
+    N_TRAIN = 1000
     N_TEST = 100
     training_data = torch.utils.data.Subset(training_data,range(N_TRAIN))
     test_data = torch.utils.data.Subset(test_data,range(N_TEST))
@@ -283,9 +284,9 @@ if args.lla_incl:
     train_methods = ['MAP']
 else:
     # methods = ['MAP','NUQLS','DE','SWAG','MC']
-    methods = ['MAP','NUQLS_TEST']
+    methods = ['MAP','NUQLS','SWAG']
     # methods = ['MAP','SWAG','MC']
-    train_methods = ['MAP','NUQLS_TEST','NUQLS','DE','MC']
+    train_methods = ['MAP','NUQLS','DE','MC']
 test_res = {}
 train_res = {}
 for m in methods:
@@ -298,7 +299,8 @@ for m in methods:
                   'oodauc': [],
                   'aucroc': [],
                   'varroc': [],
-                  'time': []}
+                  'time': [],
+                  'mem': []}
 
 prob_var_dict = {}
 prediction_dict = {}
@@ -328,6 +330,9 @@ print(f'Using {args.dataset} dataset, num train points = {len(training_data)}')
 
 for ei in tqdm.trange(n_experiment):
     print("\n--- experiment {} ---".format(ei))
+
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
 
     for m in methods:
         t1 = time.time()
@@ -402,8 +407,8 @@ for ei in tqdm.trange(n_experiment):
             id_mean = torch.nn.functional.softmax(id_map_logits,dim=1)
             ood_mean = torch.nn.functional.softmax(ood_map_logits,dim=1)
 
-        elif m == 'NUQLS_TEST':
-            nuqls_posterior = nqls.Nuqls(map_net, task='classification')
+        elif m == 'NUQLS':
+            nuqls_posterior = Nuqls(map_net, task='classification')
             loss,acc = nuqls_posterior.train(train=training_data, 
                                 train_bs=nuqls_bs, 
                                 n_output=n_output,
@@ -412,7 +417,8 @@ for ei in tqdm.trange(n_experiment):
                                 lr=nuqls_lr, 
                                 epochs=nuqls_epoch, 
                                 mu=0.9,
-                                verbose=args.verbose)
+                                verbose=args.verbose,
+                                extra_verbose=args.extra_verbose)
             train_res[m]['nll'].append(loss)
             train_res[m]['acc'].append(acc)
 
@@ -423,23 +429,6 @@ for ei in tqdm.trange(n_experiment):
 
             id_mean = id_predictions.mean(dim=0); id_logit_var = id_logits.var(0)
             ood_mean = ood_predictions.mean(dim=0); ood_logit_var = ood_logits.var(0)
-            
-            
-        elif m == 'NUQLS':
-            nuql = nuqls.classification_parallel_i(map_net)
-            loss, acc = nuql.train(train=training_data, train_bs = nuqls_bs, n_output=n_output, S = nuqls_S, scale=nuqls_gamma, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, verbose=args.verbose)
-            nuqls_predictions = nuql.test(test=test_data, test_bs=nuqls_bs)
-            ood_nuqls_predictions = nuql.test(test=ood_test_data, test_bs=nuqls_bs)
-
-            train_res[m]['nll'].append(loss)
-            train_res[m]['acc'].append(acc)
-
-            id_predictions = nuqls_predictions.softmax(dim=2)
-            ood_predictions = ood_nuqls_predictions.softmax(dim=2)
-            id_mean = nuqls_predictions.softmax(dim=2).mean(dim=0)
-            ood_mean = ood_nuqls_predictions.softmax(dim=2).mean(dim=0)
-            id_logit_var = nuqls_predictions.var(0)
-            ood_logit_var = ood_nuqls_predictions.var(0)
 
 
         elif m == 'DE':
@@ -543,16 +532,6 @@ for ei in tqdm.trange(n_experiment):
             laplace_ood_test_loader = DataLoader(ood_test_data,batch_size=bs)
             laplace_val_loader = DataLoader(val_data,batch_size=bs)
             la.fit(laplace_train_loader)
-            # la.optimize_prior_precision(
-            #     method="gridsearch",
-            #     pred_type='glm',
-            #     val_loader = laplace_val_loader,
-            #     log_prior_prec_min=-2,
-            #     log_prior_prec_max = 2,
-            #     grid_size=20,
-            #     link_approx='probit',
-            #     progress_bar=args.progress
-            # )
             la.optimize_prior_precision(
                 method="marglik",
                 pred_type='glm',
@@ -745,6 +724,7 @@ for ei in tqdm.trange(n_experiment):
 
         t2 = time.time()
         test_res[m]['time'].append(t2-t1)
+        test_res[m]['mem'].append(1e-9*torch.cuda.max_memory_allocated())
 
         p_dist = Categorical(probs=id_mean.to(device))
         test_res[m]['nll'].append(-p_dist.log_prob(test_y.to(device)).mean().item())
@@ -787,6 +767,9 @@ for ei in tqdm.trange(n_experiment):
                           save_fig=res_dir + f"vmsp_plot.pdf")
 
 ## Record results
+torch.save(train_res,'train_res_example.pt')
+torch.save(test_res,'test_res_example.pt')
+
 res_text = res_dir + f"result.txt"
 results = open(res_text,'w')
 torch.save(train_res,res_dir + f'train_res.pt')
@@ -794,52 +777,39 @@ torch.save(test_res,res_dir + f'test_res.pt')
 
 percentage_metrics = ['acc','ece','oodauc','aucroc','varroc']
 
-results.write(" --- MAP Training Details --- \n")
-results.write(f"epochs: {epochs}; M: {S}; lr: {lr}; weight_decay: {wd}\n")
+results.write("Training Details:\n")
+results.write(f'MAP/DE: epochs: {epochs}; S: {S}; lr: {lr}; wd: {wd}; bs: {bs}; n_experiment: {n_experiment}\n')
+results.write(f"NUQLS: epochs: {nuqls_epoch}; S: {nuqls_S}; lr: {nuqls_lr}; wd: {nuqls_wd}; bs: {nuqls_bs}; gamma: {nuqls_gamma}\n")
 
-results.write("\n --- NUQLS Details --- \n")
-results.write(f"epochs: {nuqls_epoch}; S: {nuqls_S}; lr: {nuqls_lr}; weight_decay: {nuqls_wd}; init scale: {nuqls_gamma}\n")
-
-for m in methods:
-    if n_experiment > 1:
-        results.write(f"\n--- Method {m} ---\n")
-        if m in train_res:
-            results.write("\n - Train Results: - \n")
-            for k in train_res[m].keys():
-                if k in percentage_metrics:
-                    results.write(f"{k}: {np.mean(train_res[m][k]):.1%} +- {np.std(train_res[m][k]):.1%} \n")
-                else:
-                    results.write(f"{k}: {np.mean(train_res[m][k]):.3f} +- {np.std(train_res[m][k]):.3f} \n")
-        results.write("\n - Test Prediction: - \n")
+if n_experiment > 1:
+    results.write("\nTrain Results:\n")
+    for m in train_res.keys():
+        results.write(f"{m}: ")
+        for k in train_res[m].keys():
+            results.write(f"{k}: {np.mean(train_res[m][k]):.4} +- {np.std(train_res[m][k]):.4}; ")
+        results.write('\n')
+    results.write("\nTest Prediction:\n")
+    for m in test_res.keys():
+        results.write(f"{m}: ")
         for k in test_res[m].keys():
-            if k == 'time':
-                t = time.strftime("%H:%M:%S", time.gmtime(np.mean(test_res[m][k])))
-                results.write(f"{k}: {t}\n")
-            elif k == 'varroc' and m == 'MAP':
+            if k == 'varroc' and m == 'MAP':
                 continue
-            elif k in percentage_metrics:
-                results.write(f"{k}: {np.mean(test_res[m][k]):.1%} +- {np.std(test_res[m][k]):.1%} \n")
-            else:
-                results.write(f"{k}: {np.mean(test_res[m][k]):.3f} +- {np.std(test_res[m][k]):.3f} \n")
-    else:
-        results.write(f"\n--- Method {m} ---\n")
-        if m in train_res:
-            results.write("\n - Train Results: - \n")
-            for k in train_res[m].keys():
-                if k in percentage_metrics:
-                    results.write(f"{k}: {train_res[m][k][0]:.1%}\n")
-                else:
-                    results.write(f"{k}: {train_res[m][k][0]:.3f}\n")
-        results.write("\n - Test Prediction: - \n")
+            results.write(f"{k}: {np.mean(test_res[m][k]):.4} +- {np.std(test_res[m][k]):.4}; ")
+        results.write('\n')
+else:
+    results.write("\nTrain Results:\n")
+    for m in train_res.keys():
+        results.write(f"{m}: ")
+        for k in train_res[m].keys():
+            results.write(f"{k}: {train_res[m][k][0]:.4}; ")
+        results.write('\n')
+    results.write("\nTest Prediction:\n")
+    for m in test_res.keys():
+        results.write(f"{m}: ")
         for k in test_res[m].keys():
-            if k == 'time':
-                t = time.strftime("%H:%M:%S", time.gmtime(test_res[m][k][0]))
-                results.write(f"{k}: {t}\n")
-            elif k == 'varroc' and m == 'MAP':
+            if k == 'varroc' and m == 'MAP':
                 continue
-            elif k in percentage_metrics:
-                results.write(f"{k}: {test_res[m][k][0]:.1%}\n")
-            else:
-                results.write(f"{k}: {test_res[m][k][0]:.3f}\n")
+            results.write(f"{k}: {test_res[m][k][0]:.4}; ")
+        results.write('\n')
 
 results.close()

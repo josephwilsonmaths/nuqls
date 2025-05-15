@@ -1,8 +1,16 @@
 /__pycache__
 /.venv
+/nuqlsenv
+/models/resnet50_trained_svhn.pt
 /results
 /predictions
 /data
 /testing
 /nuqls_performance_experiment
 /figures
+/test.ipynb
+/nuqls_test.ipynb
+/posteriors/nuqlsPosterior
+/imagenet.py
+/nuqls_performance_experiment.py
+/nuqls_experiment.ipynb

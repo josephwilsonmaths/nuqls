@@ -16,7 +16,7 @@ class classificationParallel(object):
         self.network = network
         self.device = next(network.parameters()).device
 
-    def train(self, train, train_bs, n_output, scale, S, epochs, lr, mu, verbose=False, progress_bar=True):
+    def train(self, train, train_bs, n_output, scale, S, epochs, lr, mu, verbose=False, extra_verbose=False):
         
         train_loader = DataLoader(train,train_bs)
 
@@ -49,7 +49,7 @@ class classificationParallel(object):
 
         theta_S = theta_S.detach()
         
-        if progress_bar:
+        if verbose:
             pbar = tqdm.trange(epochs)
         else:
             pbar = range(epochs)
@@ -59,7 +59,12 @@ class classificationParallel(object):
                 loss = torch.zeros((S), device='cpu')
                 acc = torch.zeros((S), device='cpu')
 
-                for x,y in train_loader:
+                if extra_verbose:
+                    pbar_inner = tqdm.tqdm(train_loader)
+                else:
+                    pbar_inner = train_loader
+
+                for x,y in pbar_inner:
                     x, y = x.to(device=self.device, non_blocking=True), y.to(device=self.device, non_blocking=True)
                     f_nlin = self.network(x)
                     proj = torch.vmap(jvp_first, (1,None,None))((theta_S),params,x).permute(1,2,0)
@@ -83,6 +88,20 @@ class classificationParallel(object):
 
                     a = (f_lin.argmax(1) == y.unsqueeze(1).repeat(1,S)).type(torch.float).sum(0).detach().cpu()  # f_lin: N x C x S, y: N
                     acc += a
+
+                    if extra_verbose:
+                        ma_l = loss / (pbar_inner.format_dict['n'] + 1)
+                        ma_a = acc / ((pbar_inner.format_dict['n'] + 1) * x.shape[0])
+                        metrics = {'min_loss_ma': ma_l.min().item(),
+                                'max_loss_batch': ma_l.max().item(),
+                                'min_acc_batch': ma_a.min().item(),
+                                'max_acc_batch': ma_a.max().item(),
+                                    'resid_norm': torch.mean(torch.square(g)).item()}
+                        if self.device == torch.device('cuda'):
+                            metrics['gpu_mem'] = 1e-9*torch.cuda.max_memory_allocated()
+                        else:
+                            metrics['gpu_mem'] = 0
+                        pbar_inner.set_postfix(metrics)
 
 
                 loss /= len(train_loader)
