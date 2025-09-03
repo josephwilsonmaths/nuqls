@@ -5,10 +5,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import posteriors.nuqls as nuqls
+from cuqls.posterior import Cuqls
 from posteriors.lla.models import MLPS
 from posteriors.lla.likelihoods import GaussianLh
 from posteriors.lla.laplace import Laplace
 import posteriors.lla_s as lla_s
+from posteriors.de import DeepEnsemble
 import argparse
 import time
 import os
@@ -18,10 +20,7 @@ import json
 import posteriors.util as util
 import posteriors.swag as swag
 import utils.regression_util as utility
-import posteriors.bde as bde
-from functorch import make_functional
-from torch.func import vmap, jacrev
-from nuqls.posterior import Nuqls
+# import posteriors.cuqls as cuqls
 
 torch.set_default_dtype(torch.float64)
 
@@ -106,16 +105,16 @@ if normalize:
 
 # Setup metrics
 # methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG'] 
-methods = ['MAP','NUQLS']
 # methods = ['MAP','NUQLS','NUQLS_MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','NUQLS_SCALE_T','NUQLS_SCALE_T_MAP','DE','LLA','SWAG']
 # methods = ['MAP','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE','LLA','SWAG']
-# methods = ['MAP','DE']
-train_methods = ['MAP','NUQLS','NUQLS_SCALE_S','NUQLS_SCALE_S_MAP','DE']
+methods = ['MAP', 'CUQLS']
+train_methods = ['MAP','CUQLS','DE']
 test_res = {}
 train_res = {}
 for m in methods:
     if m in train_methods:
-        train_res[m] = {'loss': []}
+        train_res[m] = {'loss': [],
+                        'time': []}
     test_res[m] = {'rmse': [],
                 'nll': [],
                 'ece': [],
@@ -150,6 +149,7 @@ for ei in tqdm(range(n_experiment)):
         t1 = time.time()
         if m == 'MAP':
             map_net = MLPS(input_size=input_dim-input_start, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
+            
             # map_net = ResRegressionDNN().to(device=device,dtype=torch.float64)
             map_net.apply(utility.weights_init)
             map_p = sum(p.numel() for p in map_net.parameters() if p.requires_grad)
@@ -171,7 +171,7 @@ for ei in tqdm(range(n_experiment)):
                     print("Training loss = {:.4f}".format(map_train_loss))
                     print("Test loss = {:.4f}".format(map_test_loss))
                     print("\n -------------------------------------")
-            train_res['MAP']['loss'].append(map_train_loss)
+            train_res[m]['loss'].append(map_train_loss)
 
             print(f'MAP: TEST RMSE = {np.sqrt(map_test_loss):.4}')
 
@@ -188,270 +188,94 @@ for ei in tqdm(range(n_experiment)):
                 map_pred.append(map_net(x))
             map_val_pred = torch.cat(map_pred)
 
-        elif m == 'NUQLS':
-            nuqls_posterior = Nuqls(map_net, task='regression', full_dataset=False)
-            res = nuqls_posterior.train(train=train_dataset, 
-                                train_bs=batch_size, 
-                                S = nuqls_S, 
-                                scale=0.01, 
-                                lr=nuqls_lr, 
-                                epochs=nuqls_epoch, 
-                                mu=0.9,
-                                verbose=True)
-            train_res[m]['loss'].append(res)
+        elif m == 'CUQLS':
+            cuqls_posterior = Cuqls(network=map_net, task='regression')
+            loss,resid = cuqls_posterior.train(train=train_dataset,
+                                    batchsize=batch_size, 
+                                    scale=0.01, 
+                                    S=nuqls_S, 
+                                    epochs=nuqls_epoch, 
+                                    lr=nuqls_lr, 
+                                    mu=0.9, 
+                                    verbose=True)
+            train_res[m]['loss'].append(loss)
+            cuqls_posterior.HyperparameterTuning(validation_dataset, 0.01, 10000, 100, verbose=args.verbose)
 
-            nuqls_posterior.HyperparameterTuning(validation_dataset, left=0.1, right=10, its=20, verbose=False)
-            mean_pred, var_pred = nuqls_posterior.CalibratedUncertaintyPrediction(test_dataset)
+            cuqls_test_preds = cuqls_posterior.test(test_dataset, test_bs=batch_size)
+            scaled_test_preds = cuqls_test_preds*cuqls_posterior.scale_cal
 
-        # elif m == 'NUQLS_SCALE_S':
-
-        #     left_scale, right_scale, k_scale = 0.1, 100, 20
-
-        #     if args.dataset=='song':
-        #         # # Train model for gamma = 0.1 (as reference) and get predictions
-        #         # val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
-        #         #                                 regression= 'True', train_bs = train_size, test_bs = test_size, 
-        #         #                                 S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
-        #         #                                 verbose=False)
-        #         # train_res[m]['loss'].append(res['loss'])
-
-        #         test_predictions, val_predictions = nuqls.regression_parallel(net = map_net, train = train_dataset, test=test_dataset, ood_test=validation_dataset, 
-        #                                                 train_bs = batch_size, test_bs = batch_size, 
-        #                                             S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9)
-                
-        #         train_res[m]['loss'].append(0.0)
-
-        #     else:
-        #         # Train model for gamma = 1 (as reference) and get predictions
-        #         nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
-        #                                                     lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
-        #         max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
-        #                                                     progress_bar=args.progress_bar)
-        #         val_predictions = nuqls_model.test_linear(validation_dataset)
-
-        #         train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
-
-        #         test_predictions = nuqls_model.test_linear(test_dataset)
-
-        #     for k in range(k_scale):
-        #         left_third = left_scale + (right_scale - left_scale) / 3
-        #         right_third = right_scale - (right_scale - left_scale) / 3
-
-        #         # Left ECE
-        #         scaled_nuqls_predictions = val_predictions * left_third
-        #         obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
-        #         left_ece = torch.mean(torch.square(obs_map - predicted))
-
-        #         # Right ECE
-        #         scaled_nuqls_predictions = val_predictions * right_third
-        #         obs_map, predicted = utility.calibration_curve_r(val_y,val_predictions.mean(1),scaled_nuqls_predictions.var(1),11)
-        #         right_ece = torch.mean(torch.square(obs_map - predicted))
-
-        #         if left_ece > right_ece:
-        #             left_scale = left_third
-        #         else:
-        #             right_scale = right_third
-
-        #         scale = (left_scale + right_scale) / 2
-
-        #         # Print info
-        #         if args.verbose:
-        #             print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
-
-        #         if abs(right_scale - left_scale) <= 1e-2:
-        #             break
-                
-        #     # Scale test predictions
-        #     nuqls_predictions = test_predictions*scale
-
-        #     mean_pred = test_predictions.mean(1)
-        #     var_pred = nuqls_predictions.var(1) # We only find the gamma term in the variance
-
-        # elif m == 'NUQLS_SCALE_S_MAP':
-
-        #     left_scale, right_scale, k_scale = 0.1, 100, 20
-
-        #     if args.dataset=='song':
-        #         # Train model for gamma = 0.1 (as reference) and get predictions
-        #         val_predictions, test_predictions, res = nuqls.series_method(net = map_net, train_data = train_dataset, test_data = validation_dataset, ood_test_data=test_dataset, 
-        #                                         regression= 'True', train_bs = train_size, test_bs = test_size, 
-        #                                         S = nuqls_S, scale=0.01, lr=nuqls_lr, epochs=nuqls_epoch, mu=0.9, 
-        #                                         verbose=False) # Shape of predictions is S x N x 1
-        #         val_predictions, test_predictions = val_predictions.squeeze(2).T, test_predictions.squeeze(2).T
-        #         train_res[m]['loss'].append(res['loss'])
-
-        #     else:
-        #         # Train model for gamma = 1 (as reference) and get predictions
-        #         nuqls_model = nuqls.small_regression_parallel(net = map_net, train = train_dataset, S = nuqls_S, epochs=nuqls_epoch, 
-        #                                                     lr=nuqls_lr, bs=train_size, bs_test=test_size,init_scale=0.01)
-        #         max_l2_loss,_ = nuqls_model.train_linear(mu=0.9,weight_decay=0,my=0,sy=1,threshold=None,verbose=args.extra_verbose, 
-        #                                                     progress_bar=args.progress_bar)
-        #         val_predictions = nuqls_model.test_linear(validation_dataset)
-        #         print(val_predictions.shape)
-
-        #         train_res[m]['loss'].append(max_l2_loss.detach().cpu().item())
-
-        #         test_predictions = nuqls_model.test_linear(test_dataset)
-
-        #     for k in range(k_scale):
-        #         left_third = left_scale + (right_scale - left_scale) / 3
-        #         right_third = right_scale - (right_scale - left_scale) / 3
-
-        #         # Left ECE
-        #         scaled_nuqls_predictions = val_predictions * left_third
-        #         obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
-        #         left_ece = torch.mean(torch.square(obs_map - predicted))
-
-        #         # Right ECE
-        #         scaled_nuqls_predictions = val_predictions * right_third
-        #         obs_map, predicted = utility.calibration_curve_r(val_y,map_val_pred,scaled_nuqls_predictions.var(1),11)
-        #         right_ece = torch.mean(torch.square(obs_map - predicted))
-
-        #         if left_ece > right_ece:
-        #             left_scale = left_third
-        #         else:
-        #             right_scale = right_third
-
-        #         scale = (left_scale + right_scale) / 2
-
-        #         # Print info
-        #         if args.verbose:
-        #             print(f'\nSCALE {scale:.3}:: MAP: [{left_ece:.1%},{right_ece:.1%}]') 
-
-        #         if abs(right_scale - left_scale) <= 1e-2:
-        #             break
-            
-        #     # Scale test predictions by best scale
-        #     nuqls_predictions = test_predictions*scale
-        #     mean_pred = map_test_pred
-        #     var_pred = nuqls_predictions.var(1)
+            mean_pred = cuqls_test_preds.mean(1)
+            var_pred = scaled_test_preds.var(1)
 
         elif m == 'DE':
-            model_list = []
-            opt_list = []
-            sched_list = []
+            de_network = utility.EnsembleNetwork(hidden_sizes,input_start,input_dim,args.activation).to(device=device,dtype=torch.float64)
+            de_posterior = DeepEnsemble(network=de_network, task='regression', M = 10)
+            train_nll, train_mse = de_posterior.train(loader=train_loader, 
+                                                    lr=de_lr, 
+                                                    wd=weight_decay,
+                                                    epochs=de_epochs, 
+                                                    optim_name='adam', 
+                                                    sched_name=None, 
+                                                    verbose=True,
+                                                    extra_verbose=True)
+            train_res[m]['loss'].append(train_nll)
+            mean_pred, var_pred = de_posterior.test(test_loader)
 
-            for i in range(S):
-                model_list.append(utility.EnsembleNetwork(hidden_sizes,input_start,input_dim,args.activation).to(device=device,dtype=torch.float64))
-                model_list[i].apply(utility.weights_init)
-                if args.dataset=='yacht' or args.dataset=='kin8nm':
-                    opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
-                    sched_list.append(torch.optim.lr_scheduler.CosineAnnealingLR(opt_list[i], T_max=de_epochs))                  
-                else:
-                    opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
-                    sched_list.append(None)
+        # elif m == 'DE':
+        #     model_list = []
+        #     opt_list = []
+        #     sched_list = []
 
-            de_train_total = 0
-            de_test_total = 0
-            de_mse_total = 0
-            de_t1 = time.time()
-            for i in tqdm(range(S)):
-                for epoch in range(de_epochs):
-                    de_train_loss = utility.train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=sched_list[i])
-                    de_test_loss, de_test_mse = utility.test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
-                    if args.extra_verbose and epoch % 10 == 0:
-                        print("Epoch {} of {}".format(epoch,de_epochs))
-                        print("Training loss = {:.4f}".format(de_train_loss))
-                        print("Test loss = {:.4f}".format(de_test_loss))
-                        print("Test mse = {:.4f}".format(de_test_mse))
-                        print("\n -------------------------------------")
-                # import sys; sys.exit(0)
-                de_train_total += de_train_loss
-                de_test_total += de_test_loss
-                de_mse_total += de_test_mse
-            de_train_total /= S
-            de_test_total /= S
-            de_mse_total /= S
+        #     for i in range(S):
+        #         model_list.append(utility.EnsembleNetwork(hidden_sizes,input_start,input_dim,args.activation).to(device=device,dtype=torch.float64))
+        #         model_list[i].apply(utility.weights_init)
+        #         if args.dataset=='yacht' or args.dataset=='kin8nm':
+        #             opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
+        #             sched_list.append(torch.optim.lr_scheduler.CosineAnnealingLR(opt_list[i], T_max=de_epochs))                  
+        #         else:
+        #             opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
+        #             sched_list.append(None)
 
-            train_res[m]['loss'].append(de_train_total)
+        #     de_train_total = 0
+        #     de_test_total = 0
+        #     de_mse_total = 0
+        #     de_t1 = time.time()
+        #     for i in tqdm(range(S)):
+        #         for epoch in range(de_epochs):
+        #             de_train_loss = utility.train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=sched_list[i])
+        #             de_test_loss, de_test_mse = utility.test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
+        #             if args.extra_verbose and epoch % 10 == 0:
+        #                 print("Epoch {} of {}".format(epoch,de_epochs))
+        #                 print("Training loss = {:.4f}".format(de_train_loss))
+        #                 print("Test loss = {:.4f}".format(de_test_loss))
+        #                 print("Test mse = {:.4f}".format(de_test_mse))
+        #                 print("\n -------------------------------------")
+        #         # import sys; sys.exit(0)
+        #         de_train_total += de_train_loss
+        #         de_test_total += de_test_loss
+        #         de_mse_total += de_test_mse
+        #     de_train_total /= S
+        #     de_test_total /= S
+        #     de_mse_total /= S
 
-            ensemble_het_mu = torch.empty((S,test_size))
-            ensemble_het_var = torch.empty((S,test_size))
-            for i in range(S):
-                for X,y in test_loader:
-                    X,y = X.to(device), y.to(device)
-                    y = y.reshape((y.shape[0],1))
-                    mu, sig = model_list[i](X)
-                    mu = mu
-                    sig = sig
-                    ensemble_het_mu[i,:] = mu.reshape(1,-1)
-                    ensemble_het_var[i,:] = sig.reshape(1,-1)
+        #     train_res[m]['loss'].append(de_train_total)
 
-            mean_pred = torch.mean(ensemble_het_mu,dim=0)
-            var_pred = torch.mean(ensemble_het_var + torch.square(ensemble_het_mu), dim=0) - torch.square(mean_pred)
+        #     ensemble_het_mu = torch.empty((S,test_size))
+        #     ensemble_het_var = torch.empty((S,test_size))
+        #     for i in range(S):
+        #         for X,y in test_loader:
+        #             X,y = X.to(device), y.to(device)
+        #             y = y.reshape((y.shape[0],1))
+        #             mu, sig = model_list[i](X)
+        #             mu = mu
+        #             sig = sig
+        #             ensemble_het_mu[i,:] = mu.reshape(1,-1)
+        #             ensemble_het_var[i,:] = sig.reshape(1,-1)
 
-        elif m == 'BDE':
+        #     mean_pred = torch.mean(ensemble_het_mu,dim=0)
+        #     var_pred = torch.mean(ensemble_het_var + torch.square(ensemble_het_mu), dim=0) - torch.square(mean_pred)
 
-            weight_decay = 0
-            sigma2 = 1
 
-            model_list = []
-            opt_list = []
-            sched_list = []
-
-            bde_preds = torch.empty((S,test_size))
-            bde_var = torch.empty((S,test_size))
-
-            for i in range(S):
-
-                bde_model1 = MLPS(input_size=input_dim-input_start, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
-                bde_model1.apply(bde.bde_weights_init)
-                opt = torch.optim.Adam(bde_model1.parameters(), lr = lr, weight_decay=weight_decay)
-                sched = None
-
-                ## Find theta~
-                bde_model2 = MLPS(input_size=input_dim-input_start, hidden_sizes=hidden_sizes, output_size=1, activation=args.activation, flatten=False, bias=True).to(device=device, dtype=torch.float64)
-                bde_model2.apply(bde.bde_weights_init) 
-                theta_star_k = bde.l_layer_params(bde_model2)
-
-                ## Create delta functions
-                fnet, params = make_functional(bde_model1)
-
-                def fnet_single(params, x):
-                    return fnet(params, x.unsqueeze(0)).squeeze(0)
-            
-
-                def jacobian(x):
-                    J = vmap(jacrev(fnet_single), (None, 0))(params, x.to(device))
-                    J = [j.detach().flatten(1) for j in J]
-                    J = torch.cat(J,dim=1).detach()
-                    return J
-                
-                
-                delta = lambda x : jacobian(x) @ theta_star_k
-                train_delta = []
-
-                for x,_ in train_loader:
-                    train_delta.append(delta(x))
-                train_delta = torch.cat(train_delta)
-
-                print('shapes')
-                print(train_delta.shape)
-
-                ## Save theta_k
-                theta_k = torch.nn.utils.parameters_to_vector(bde_model1.parameters()).detach().clone()
-
-                sigma2 = 1
-
-                Lambda = 1 / sigma2
-
-                ## Train ensemble member
-                print("\nTraining model {}".format(i))
-                for t in tqdm(range(epochs)):
-                    train_loss = bde.train_bde(train_loader, bde_model1, delta, theta_k, mse_loss, Lambda, opt, sched)
-                    # if t % (epochs / 10) == 0:
-                    #     print("train loss = {:.4f}".format(train_loss))
-                print("Done!")
-                print("train loss = {:.4f}".format(train_loss))
-
-                # Get predictions
-                bde_pred = []
-                for x,_ in lla_test_loader:
-                    bde_pred.append(bde_model1(x).reshape(-1) + delta(x).reshape(-1))
-
-            bre_preds = torch.cat(bde_pred,dim=0)
-            var_pred = torch.var(bde_preds,dim=0)
-        
         elif m == 'LLA':
             if args.dataset == 'protein':
                 cov_type = 'kron'
@@ -578,12 +402,16 @@ for ei in tqdm(range(n_experiment)):
             var_pred = swag_pred.var(axis=0)
 
         print(f"\n--- Method {m} ---")
+        t2 = time.time()
         if m in train_res:
             print("\nTrain Results:")
             print(f"Train Loss: {train_res[m]['loss'][ei]:.3f}")
+            # if m == 'MAP':
+            train_res[m]['time'].append(t2-t1)
+            t = train_res[m]['time'][ei]
+            print(f'Time(s): {t:.3f}')
 
         if m != 'MAP':
-            t2 = time.time()
             test_res[m]['time'].append(t2-t1)
 
             test_res[m]['rmse'].append(torch.sqrt(mse_loss(mean_pred.detach().cpu().reshape(-1,1),test_y.reshape(-1,1))).detach().cpu().item())

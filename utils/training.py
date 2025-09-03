@@ -10,7 +10,7 @@ device = (
     else "cpu"
 )
 
-def train_loop(dataloader, model, loss_fn, optimizer, scheduler, train_mode=True):
+def train_loop(dataloader, model, loss_fn, optimizer, scheduler, device='cpu', train_mode=True):
     # Set the model to training mode - important for batch normalization and dropout layers
     # Unnecessary in this situation but added for best practices
     if train_mode:

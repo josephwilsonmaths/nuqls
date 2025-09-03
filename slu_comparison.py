@@ -68,11 +68,8 @@ S = config.getint(field,'S')
 nuqls_S = config.getint(field,'nuqls_S')
 nuqls_epoch = config.getint(field,'nuqls_epoch')
 nuqls_lr = config.getfloat(field,'nuqls_lr')
-nuqls_wd = config.getfloat(field,'nuqls_wd')
 nuqls_bs = config.getint(field,'nuqls_bs')
 nuqls_gamma = config.getfloat(field,'nuqls_gamma')
-nuqls_parallel = config.getboolean(field,'nuqls_parallel')
-print(f'nuqls_parallel = {nuqls_parallel}')
 # ---
 
 
@@ -248,7 +245,7 @@ results.write(" --- MAP Training Details --- \n")
 results.write(f"epochs: {epochs}; M: {S}; lr: {lr}; weight_decay: {wd}\n")
 
 results.write("\n --- NUQLS Details --- \n")
-results.write(f"epochs: {nuqls_epoch}; S: {nuqls_S}; lr: {nuqls_lr}; weight_decay: {nuqls_wd}; init scale: {nuqls_gamma}\n")
+results.write(f"epochs: {nuqls_epoch}; S: {nuqls_S}; lr: {nuqls_lr};  init scale: {nuqls_gamma}\n")
 
 results.write("\n - NUQLS Result: - \n")
 for d in aucroc.keys():

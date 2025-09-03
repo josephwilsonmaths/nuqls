@@ -36,6 +36,8 @@ class regressionParallelFull(object):
         J = [j.detach().flatten(1) for j in J]
         J = torch.cat(J,dim=1).detach()
 
+        print(J.shape)
+
         # Set progress bar
         if progress_bar:
             pbar = tqdm.trange(epochs)
