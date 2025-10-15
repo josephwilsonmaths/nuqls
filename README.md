@@ -1,5 +1,5 @@
 # Uncertainty Quantification with the Empirical Neural Tangent Kernel
-Code repository for experiments and figures in the main text of the paper "Uncertainty Quantification with the Empirical Neural Tangent Kernel".
+Code repository for experiments and figures in the main text of the paper ["Uncertainty Quantification with the Empirical Neural Tangent Kernel"](https://arxiv.org/pdf/2502.02870) .
 
 ## Setup
 We use **Python** `3.11`.
@@ -12,5 +12,5 @@ The image_classification.py script will save the predictions for each method in 
 you need to run the `image_classification.py` script once, and then again with the flag `--lla_incl`. Change the directory in `plotting_script.ipynb` to the respective files.
 
 ## Reference to Code
-Adapted code for [LLA](https://github.com/AlexImmer/BNN-predictions) method, [SWAG](https://github.com/wjmaddox/swa_gaussian) method, and [VaLLA](https://github.com/Ludvins/Variational-LLA) method.
+Please see paper for references to codebases for any implimented methods. 
 
