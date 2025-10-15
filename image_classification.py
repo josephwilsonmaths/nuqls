@@ -10,7 +10,9 @@ import posteriors.util as pu
 import posteriors.swag as swag
 import posteriors.nuqls as nuqls
 import posteriors.lla_s as lla_s
+import posteriors.mc as mc
 import utils.metrics as metrics
+from posteriors.de import DeepEnsemble
 from posteriors.valla.utils.metrics import SoftmaxClassification, OOD, psd_safe_cholesky
 from posteriors.valla.src.valla import VaLLAMultiClassBackend
 from posteriors.valla.utils.pytorch_learning import fit
@@ -72,8 +74,8 @@ ood_test_dataloader = dataset.oodtestloader(batch_size=config['bs'])
 loss_fn = nn.CrossEntropyLoss()
 
 # Setup metrics
-methods = ['MAP','CUQLS','LLA']
-train_methods = ['MAP','BE','NUQLS','CUQLS','DE','MC']
+methods = ['MAP','NUQLS']
+train_methods = ['MAP','BE','NUQLSi','NUQLS','DE']
 test_res = {}
 train_res = {}
 for m in methods:
@@ -85,15 +87,9 @@ for m in methods:
                   'ece': [],
                   'oodauc': [],
                   'aucroc': [],
-                  'varroc': [],
-                  'varroc_id': [],
-                  'varroc_ood': [],
-                  'varroc_rot': [],
                   'time': [],
                   'mem': []}
-                  
     
-
 prob_var_dict = {}
 prediction_dict = {}
 tolerance_acc_dict = {}
@@ -109,8 +105,6 @@ else:
 
 if not os.path.exists(res_dir):
     os.makedirs(res_dir)
-
-
 
 if args.verbose:
     print(f'Using {args.dataset} dataset, num train points = {len(dataset.training_data)}')
@@ -137,10 +131,17 @@ for ei in tqdm.trange(config['n_experiment']):
 
             if args.pre_load:
                 print('Using pre-loaded weights!')
-                map_net.load_state_dict(torch.load(f'models/{args.model}_trained_{args.dataset}.pt', weights_only=True, map_location=device))
-                map_net.eval()
-                train_res[m]['nll'].append(0.0)
-                train_res[m]['acc'].append(1.0)
+                model_dict = torch.load(f'models/{args.model}_trained_{args.dataset}.pt', weights_only=True, map_location=device)
+                if 'params' in model_dict.keys():
+                    map_net.load_state_dict(model_dict['params'])
+                    map_net.eval()
+                    train_res[m]['nll'].append(model_dict['nll'])
+                    train_res[m]['acc'].append(model_dict['acc'])
+                else:
+                    map_net.load_state_dict(model_dict)
+                    map_net.eval()
+                    train_res[m]['nll'].append(0.0)
+                    train_res[m]['acc'].append(1.0)
             else:
                 optimizer, scheduler = utils.optimizers.get_optim_sched(map_net, config['optim'], config['sched'], config['lr'], config['wd'], config['epochs'])
                 train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader,test_loader=test_dataloader,
@@ -149,7 +150,10 @@ for ei in tqdm.trange(config['n_experiment']):
                                                                             verbose=args.verbose, progress_bar=args.progress)
                 train_res[m]['nll'].append(train_loss)
                 train_res[m]['acc'].append(train_acc)
-                torch.save(map_net.state_dict(), f'models/{args.model}_trained_{args.dataset}.pt')
+                model_dict = {'params': map_net.state_dict(),
+                              'nll': train_loss,
+                              'acc': train_acc}
+                torch.save(model_dict, f'models/{args.model}_trained_{args.dataset}.pt')
 
             if args.dataset == 'imagenet':
                 continue
@@ -157,18 +161,16 @@ for ei in tqdm.trange(config['n_experiment']):
                 id_map_logits = pu.test_sampler(map_net, dataset.test_data, bs=config['bs'], probit=False)
                 ood_map_logits = pu.test_sampler(map_net, dataset.ood_test_data, bs=config['bs'], probit=False)
 
-                id_mean = torch.nn.functional.softmax(id_map_logits,dim=1)
-                ood_mean = torch.nn.functional.softmax(ood_map_logits,dim=1)
+                id_mean = torch.nn.functional.softmax(id_map_logits,dim=1).cpu(); id_var=None
+                ood_mean = torch.nn.functional.softmax(ood_map_logits,dim=1).cpu(); ood_var=None
+
 
             id_predictions = id_mean; ood_predictions = ood_mean
-            torch.save(id_predictions, 'MAP_preds.pt')
-            torch.save(ood_predictions, 'MAP_preds_ood.pt')
-            torch.save(id_map_logits, 'MAP_preds_logits.pt')
-            torch.save(ood_map_logits, 'MAP_preds_ood_logits.pt')
 
         elif m == 'NUQLS':
             nuqls_posterior = Nuqls(map_net, task='classification')
             print(f'MEM BEFORE NUQLS: {1e-9*torch.cuda.max_memory_allocated()}')
+            network_mean = True
             if not args.nuqls_pre_load:
                 loss,acc = nuqls_posterior.train(train=dataset.training_data, 
                                     train_bs=config['nuqls_bs'], 
@@ -176,12 +178,14 @@ for ei in tqdm.trange(config['n_experiment']):
                                     S=config['nuqls_S'],
                                     scale=config['nuqls_gamma'], 
                                     lr=config['nuqls_lr'], 
-                                    epochs=config['nuqls_epochs'], 
+                                    epochs=config['nuqls_epoch'], 
                                     mu=0.9,
+                                    threshold=train_res['MAP']['nll'][ei],
                                     verbose=args.verbose,
                                     extra_verbose=args.extra_verbose,
                                     save_weights=f'models/nuqls_{args.model}_{args.dataset}.pt'
                                     )
+                # nuqls_posterior.HyperparameterTuning(dataset.val_data, metric = 'varroc-id', left = 1e-2, right = 1e2, its = 100, network_mean = network_mean, verbose=args.extra_verbose)
                 train_res[m]['nll'].append(loss)
                 train_res[m]['acc'].append(acc)
                 pre_load = None
@@ -189,6 +193,8 @@ for ei in tqdm.trange(config['n_experiment']):
                 train_res[m]['nll'].append(0.0)
                 train_res[m]['acc'].append(1.0)
                 pre_load = f'models/nuqls_{args.model}_{args.dataset}.pt'
+                nuqls_posterior.pre_load(pre_load)
+                # nuqls_posterior.HyperparameterTuning(dataset.val_data, metric = 'varroc-id', left = 1e-2, right = 1e2, its = 100, network_mean = network_mean, verbose=args.extra_verbose)
 
             if args.dataset == 'imagenet':
                 res_text = res_dir + f"result.txt"
@@ -197,47 +203,10 @@ for ei in tqdm.trange(config['n_experiment']):
                 results.close()
                 import sys; sys.exit(0)
 
-            id_logits = nuqls_posterior.test(dataset.test_data, test_bs=config['nuqls_bs']) 
-            id_predictions = id_logits.softmax(dim=2)
-            ood_logits = nuqls_posterior.test(dataset.ood_test_data, test_bs=config['nuqls_bs'])
-            ood_predictions = ood_logits.softmax(dim=2)
+            id_mean, id_var = nuqls_posterior.UncertaintyPrediction(test=dataset.test_data, test_bs=config['nuqls_bs'], network_mean=network_mean)
+            ood_mean, ood_var = nuqls_posterior.UncertaintyPrediction(test=dataset.ood_test_data, test_bs=config['nuqls_bs'], network_mean=network_mean)
 
-            id_mean = id_predictions.mean(dim=0); id_logit_var = id_logits.var(0)
-            ood_mean = ood_predictions.mean(dim=0); ood_logit_var = ood_logits.var(0)
-            
-        elif m == 'CUQLS':
-            cuqls_posterior = Cuqls(map_net, task='classification')
-            print(f'MEM BEFORE CUQLS: {1e-9*torch.cuda.max_memory_allocated()}')
-            loss,acc = cuqls_posterior.train(train=dataset.training_data, 
-                                batchsize=config['cuqls_bs'], 
-                                S=config['cuqls_S'],
-                                scale=config['cuqls_gamma'], 
-                                lr=config['cuqls_lr'], 
-                                epochs=config['cuqls_epoch'], 
-                                mu=0.9,
-                                scheduler=False,
-                                threshold=0.1,
-                                verbose=args.verbose,
-                                extra_verbose=args.extra_verbose,
-                                save_weights=f'models/cuqls_{args.model}_{args.dataset}.pt'
-                                )
-            # cuqls_posterior.HyperparameterTuning(dataset.val_data, metric = 'varroc-id', left = 1e-2, right = 1e2, its = 100, verbose=True)
-            train_res[m]['nll'].append(loss)
-            train_res[m]['acc'].append(acc)
-
-            id_logits = cuqls_posterior.test(dataset.test_data, test_bs=config['cuqls_bs']) 
-            id_predictions = id_logits.softmax(dim=2)
-            ood_logits = cuqls_posterior.test(dataset.ood_test_data, test_bs=config['cuqls_bs'])
-            ood_predictions = ood_logits.softmax(dim=2)
-
-            id_mean = id_predictions.mean(dim=0); id_logit_var = id_logits.var(0)
-            ood_mean = ood_predictions.mean(dim=0); ood_logit_var = ood_logits.var(0)
-
-            torch.save(id_logits, 'id_logits.pt')
-            torch.save(ood_logits, 'ood_logits.pt')
-            torch.save(id_predictions, 'id_preds.pt')
-
-            pred_function = lambda dataset_input : cuqls_posterior.test(dataset_input, test_bs=50) 
+            var_function = lambda dataset_input : nuqls_posterior.UncertaintyPrediction(test=dataset_input, test_bs=config['nuqls_bs'], network_mean=network_mean)[1] 
 
         elif m == 'BE':
             beS = 5
@@ -288,43 +257,22 @@ for ei in tqdm.trange(config['n_experiment']):
 
 
         elif m == 'DE':
-            model_list = []
-            opt_list = []
-            sched_list = []
-            for i in range(config['S']):
-                model_list.append(utils.networks.get_model(args.model, dataset.n_output, dataset.n_channels).to(device))
-                optimizer, scheduler = utils.optimizers.get_optim_sched(model_list[i], config['optim'], config['sched'], config['lr'], config['wd'], config['epochs'])
-                opt_list.append(optimizer)
-                sched_list.append(scheduler)
+            de_posterior = DeepEnsemble(network=map_net, task='classification', M = 10)
+            train_nll, train_acc = de_posterior.train(loader=train_dataloader, 
+                                                    lr=config['lr'], 
+                                                    wd=config['wd'],
+                                                    epochs=config['epochs'], 
+                                                    optim_name=config['optim'], 
+                                                    sched_name=config['sched'], 
+                                                    verbose=args.verbose,
+                                                    extra_verbose=args.extra_verbose)
+            train_res[m]['nll'].append(train_nll)
+            train_res[m]['acc'].append(train_acc)
 
-            de_train_loss = 0
-            de_train_acc = 0
+            id_mean, id_var = de_posterior.UncertaintyPrediction(test_dataloader)
+            ood_mean, ood_var = de_posterior.UncertaintyPrediction(ood_test_dataloader)
 
-            if args.progress:
-                pbar = tqdm.trange(config['S'])
-            else:
-                pbar = range(config['S'])
-
-            for i in pbar:
-                train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader, test_loader=test_dataloader,
-                                                                            model=model_list[i],loss_fn=loss_fn,optimizer=opt_list[i],
-                                                                            scheduler=sched_list[i],epochs=config['epochs'],verbose=args.verbose, progress_bar=False)
-                de_train_loss += train_loss
-                de_train_acc += train_acc
-            de_train_loss /= config['S']
-            de_train_acc /= config['S']
-
-            train_res[m]['nll'].append(de_train_loss)
-            train_res[m]['acc'].append(de_train_acc)
-            
-            ### Deep ensembles inference
-
-            id_mean, _, id_predictions = pu.ensemble_sampler(dataset=dataset.test_data,M=config['S'],      # id_predictions -> S x N x C
-                                                    models=model_list,n_output=dataset.n_output,
-                                                    bs=config['bs'])
-            ood_mean, _, ood_predictions = pu.ensemble_sampler(dataset=dataset.ood_test_data,M=config['S'],    # ood_predictions -> : S x N x C
-                                                    models=model_list,n_output=dataset.n_output,
-                                                    bs=config['bs'])
+            var_function = lambda dataset : de_posterior.UncertaintyPrediction(DataLoader(dataset, config['bs']))[1]
     
         # elif m == 'eNUQLS':
         #     S = config['nuqls_S']
@@ -380,13 +328,17 @@ for ei in tqdm.trange(config['n_experiment']):
 
 
             T = 1000
-            id_mean, _, id_predictions = pu.lla_sampler(dataset=dataset.test_data, 
+            id_mean, id_var, _ = pu.lla_sampler(dataset=dataset.test_data, 
                                                               model = lambda x : la.predictive_samples(x=x,pred_type='glm',n_samples=T), 
                                                               bs = config['bs'])  # id_predictions -> S x N x C
 
-            ood_mean, _, ood_predictions = pu.lla_sampler(dataset=dataset.ood_test_data, 
+            ood_mean, ood_var, _ = pu.lla_sampler(dataset=dataset.ood_test_data, 
                                                                     model = lambda x : la.predictive_samples(x=x,pred_type='glm',n_samples=T), 
                                                                     bs = config['bs'])  # ood_predictions -> S x N x C
+            
+            var_function = lambda dataset : pu.lla_sampler(dataset=dataset, 
+                                                                    model = lambda x : la.predictive_samples(x=x,pred_type='glm',n_samples=T), 
+                                                                    bs = config['bs'])[1]
             
         elif m == 'LLA_S':
             zeta, scale = lla_s.classification(net=map_net, train=dataset.training_data, train_bs=50, k=9, n_output=dataset.n_output, 
@@ -520,46 +472,25 @@ for ei in tqdm.trange(config['n_experiment']):
                 swag_wd = 0
             swag_net = swag.SWAG(map_net,epochs = config['epochs'],lr = swag_lr, cov_mat = True,
                                 max_num_models=config['S'], wd=swag_wd)
-            swag_net.train_swag(train_dataloader=train_dataloader,progress_bar=args.progress)
+            swag_net.train_swag(train_dataloader=train_dataloader,progress_bar=args.verbose)
 
             T = 100
-            id_mean, _, id_predictions = pu.swag_sampler(dataset=dataset.test_data,model=swag_net,T=T,n_output=dataset.n_output,bs=config['bs']) # id_predictions -> S x N x C
-            ood_mean, _, ood_predictions = pu.swag_sampler(dataset=dataset.ood_test_data,model=swag_net,T=T,n_output=dataset.n_output,bs=1000) # ood_predictions -> S x N x C
+            id_mean, id_var, _ = pu.swag_sampler(dataset=dataset.test_data,model=swag_net,T=T,n_output=dataset.n_output,bs=config['bs']) # id_predictions -> S x N x C
+            ood_mean, ood_var, _ = pu.swag_sampler(dataset=dataset.ood_test_data,model=swag_net,T=T,n_output=dataset.n_output,bs=config['bs']) # ood_predictions -> S x N x C
+            
+            var_function = lambda input_dataset : pu.swag_sampler(dataset=input_dataset,model=swag_net,T=T,n_output=dataset.n_output,bs=config['bs'])[1]
         
+
         elif m == 'MC':
             p = 0.1
+            T = 10
+            dropout_posterior = mc.MCDropout(network=map_net,
+                                 p=p)
 
-            if args.model == 'lenet':
-                mc_net = model.LeNet5_Dropout(p=p).to(device)
-            elif args.model == 'resnet9':
-                mc_net = model.ResNet9(in_channels=dataset.n_channels, num_classes=dataset.n_output, p=p).to(device)
-            elif args.model == 'wrn':
-                mc_net = model.WRN(depth=28, widening_factor=5, num_classes = dataset.n_output, drop_rate=p).to(device)
-            elif args.model == 'resnet50':
-                mc_net = model.ResNet50(in_channels=dataset.n_channels, num_classes = dataset.n_output, p = p).to(device)
-            mc_net.apply(utils.training.init_weights)
-            mc_net.eval()
-            num_weights = sum(p.numel() for p in mc_net.parameters() if p.requires_grad)
-
-            if args.model == 'resnet50':
-                optimizer = torch.optim.SGD(mc_net.parameters(), lr=config['lr'], momentum=0.9, weight_decay=config['wd'])
-            else:
-                optimizer = torch.optim.Adam(mc_net.parameters(), lr=config['lr'], weight_decay=config['wd'])
-            if args.model == 'resnet9' and args.dataset == 'cifar10':
-                scheduler = None
-            else:
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = config['epochs'])
-
-            train_loss, train_acc, _, _ = utils.training.training(train_loader=train_dataloader,test_loader=test_dataloader,
-                                                                        model=mc_net, loss_fn=loss_fn, optimizer=optimizer,
-                                                                        scheduler=scheduler,epochs=config['epochs'],
-                                                                        verbose=False, train_mode=False, progress_bar=args.progress)
-            train_res[m]['nll'].append(train_loss)
-            train_res[m]['acc'].append(train_acc)
+            id_mean, id_var = dropout_posterior.mean_variance(test_dataloader, samples=T, verbose=args.extra_verbose)
+            ood_mean, ood_var = dropout_posterior.mean_variance(ood_test_dataloader, samples=T, verbose=args.extra_verbose)
             
-            T = 100
-            id_mean, _, id_predictions = pu.dropout_sampler(dataset=dataset.test_data,model=mc_net,T=T,n_output=dataset.n_output,bs=config['bs']) # id_predictions -> S x N x C
-            ood_mean, _, ood_predictions = pu.dropout_sampler(dataset=dataset.ood_test_data,model=mc_net,T=T,n_output=dataset.n_output,bs=config['bs']) # ood_predictions -> S x N x C
+            var_function = lambda dataset : dropout_posterior.mean_variance(DataLoader(dataset, batch_size=config['bs']), samples=T, verbose=args.extra_verbose)[1]
 
         # Record metrics
         t2 = time.time()
@@ -567,7 +498,11 @@ for ei in tqdm.trange(config['n_experiment']):
         test_res[m]['mem'].append(1e-9*torch.cuda.max_memory_allocated())
 
         # [ce, acc, ece, oodauc, aucroc, vmsp_dict]
-        metrics_m = metrics.compute_metrics(test_dataloader, id_predictions.cpu(), ood_predictions.cpu(), samples=(m != 'MAP'))
+        metrics_m = metrics.compute_metrics(test_loader=test_dataloader, 
+                                            id_mean=id_mean, id_var=id_var, 
+                                            ood_mean=ood_mean, ood_var=ood_var, 
+                                            variance=(m != 'MAP'), sum=False)
+        # metrics_m = metrics.compute_metrics(test_dataloader, id_predictions.cpu(), ood_predictions.cpu(), samples=(m != 'MAP'))
 
         test_res[m]['nll'].append(metrics_m[0])
         test_res[m]['acc'].append(metrics_m[1])
@@ -575,26 +510,21 @@ for ei in tqdm.trange(config['n_experiment']):
         test_res[m]['oodauc'].append(metrics_m[3])
         test_res[m]['aucroc'].append(metrics_m[4])
         if m != 'MAP':
-            test_res[m]['varroc'].append(metrics_m[5])
-            test_res[m]['varroc_id'].append(metrics_m[6])
-            test_res[m]['varroc_ood'].append(metrics_m[7])
             prob_var_dict[m] = metrics_m[8]
-            acc_conf, acc_var = metrics.tolerance_acc(id_predictions.cpu(), test_dataloader)
+            acc_conf, acc_var = metrics.tolerance_acc(mean=id_mean, variance=id_var, test_loader=test_dataloader)
             tolerance_acc_dict[m] = {'conf': acc_conf,
                                         'var': acc_var}
-            varroc_rot, acc_rot = metrics.rotated_dataset(id_predictions, pred_function, args.dataset)
+            if args.dataset == 'mnist' or args.dataset == 'fmnist':
+                varroc_rot = metrics.rotated_dataset(id_var, var_function, args.dataset)
+            else:
+                varroc_rot = 0.00
             test_res[m]['varroc_rot'].append(varroc_rot)
-            torch.save(acc_rot, f'{m}_acc_rot.pt')
 
         elif m == 'MAP':
-            acc_conf = metrics.tolerance_acc(id_predictions.cpu(), test_dataloader, deterministic=True)
+            acc_conf = metrics.tolerance_acc(mean=id_mean, variance=id_var, test_loader=test_dataloader, deterministic=True)
             tolerance_acc_dict[m] = {'conf': acc_conf}
 
-
-
         metrics.print_results(m, test_res, ei, (train_res if m in train_methods else None))
-        if m != 'MAP':
-            print(f'acc_rot: {acc_rot}')
 
     # Save predictions, variances for plotting
     if args.save_var:
@@ -604,6 +534,8 @@ for ei in tqdm.trange(config['n_experiment']):
         metrics.plot_vmsp(prob_dict=prob_var_dict,
                           title=f'{args.dataset} {args.model}',
                           save_fig=res_dir + f"vmsp_plot.pdf")
+        
+        torch.save(tolerance_acc_dict, res_dir + f"tolerance_acc_dict_{ei}.pt")
         
     metrics.tolerance_plot(tolerance_acc_dict, save_fig=res_dir + f"tolerance_plot.pdf")
 

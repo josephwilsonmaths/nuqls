@@ -71,7 +71,7 @@ def unflatten_like(vector, likeTensorList):
 
 class SWAG(torch.nn.Module):
 
-    def __init__(self,net,epochs=50,lr=1e-3,cov_mat=True,max_num_models=0,var_clamp=1e-30,wd=0):
+    def __init__(self,net,epochs=50,lr=1e-3,cov_mat=True,max_num_models=0,var_clamp=1e-30,wd=0,target='multiclass'):
         super(SWAG,self).__init__()
         self.swag_net = copy.deepcopy(net)
 
@@ -85,7 +85,11 @@ class SWAG(torch.nn.Module):
         self.max_num_models = max_num_models
         self.var_clamp = var_clamp
 
-        self.loss_fn = torch.nn.CrossEntropyLoss()
+        self.target = target
+        if self.target == 'multiclass':
+            self.loss_fn = torch.nn.CrossEntropyLoss()
+        elif self.target == 'binary':
+            self.loss_fn = torch.nn.BCEWithLogitsLoss()
         self.optimizer = torch.optim.SGD(self.swag_net.parameters(), lr=self.lr, weight_decay=self.wd)
 
         self.swag_net.apply(
@@ -110,8 +114,12 @@ class SWAG(torch.nn.Module):
         else:
             pbar = range(self.epochs)
         for _ in pbar:
-            train_loop(dataloader=train_dataloader, model=self.swag_net, loss_fn=self.loss_fn,
-                        optimizer=self.optimizer, scheduler=None)
+            if self.target == 'multiclass':
+                train_loop(dataloader=train_dataloader, model=self.swag_net, loss_fn=self.loss_fn,
+                            optimizer=self.optimizer, scheduler=None)
+            elif self.target == 'binary':
+                train_loop_binary(dataloader=train_dataloader, model=self.swag_net, loss_fn=self.loss_fn,
+                            optimizer=self.optimizer, scheduler=None)
             self.collect_model()
         
     def collect_model(self):
@@ -231,6 +239,20 @@ class SWAG(torch.nn.Module):
 
         for (module, name), sample in zip(self.params, samples_list):
             module.__setattr__(name, torch.nn.parameter.Parameter(sample))
+
+    def test(self, loader, samples):
+
+        prediction_samples = []
+        for _ in tqdm.trange(samples):
+            self.sample(cov=True)
+            batches = []
+            for x,_ in loader:
+                batches.append(self.forward(x=x).detach()) # output is (batchsize x output)
+            batches = torch.cat(batches, dim=0)
+            prediction_samples.append(batches)
+        prediction_samples = torch.stack(prediction_samples, dim=0)
+
+        return prediction_samples # Samples x N x C
 
 class SWAG_R(torch.nn.Module):
     '''
@@ -434,3 +456,36 @@ def train_loop(dataloader, model, loss_fn, optimizer, scheduler):
         correct /= size
 
         return train_loss, correct
+
+def train_loop_binary(dataloader, model, loss_fn, optimizer, scheduler, device='cpu', train_mode=True):
+    # Set the model to training mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    if train_mode:
+        model.train()
+    else:
+        model.eval()
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)    
+    train_loss, correct = 0, 0
+    for batch, (X, y) in enumerate(dataloader):
+        X,y = X.to(device), y.to(device)
+        # Compute prediction and loss
+        pred = model(X)
+        loss = loss_fn(pred, y.to(dtype=torch.float64).unsqueeze(1))
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Evaluate metrics
+        train_loss += loss.item()
+        correct += (pred.sigmoid().round().squeeze(1) == y).type(torch.float).sum().item()
+
+    if scheduler is not None:
+        scheduler.step()
+
+    train_loss /= num_batches
+    correct /= size
+
+    return train_loss, correct

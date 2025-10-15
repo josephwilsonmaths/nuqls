@@ -162,6 +162,12 @@ for ei in tqdm(range(n_experiment)):
                 optimizer = torch.optim.Adam(map_net.parameters(), lr=lr, weight_decay=weight_decay)
                 scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=epochs*10, power=0.5)
 
+            if args.verbose:
+                full_train_loader = DataLoader(train_dataset, len(train_dataset))
+                train_x, _  = next(iter(full_train_loader))
+                ntk_rank, ntk_linear_dependence, ntk_shape, ck_rank, ck_linear_dependence, ck_shape = utility.rank_calc(map_net, train_x)
+                print(f'Before training: NTK ({ntk_shape}) | rank: {ntk_rank}, nullity: {ntk_shape[1]-ntk_rank}, lin_dep: {ntk_linear_dependence:.3f}, CK ({ck_shape}) | rank: {ck_rank}, nullity: {ck_shape[1]-ck_rank}, lin_dep: {ck_linear_dependence}')
+
             # Run the training loop
             for epoch in tqdm(range(epochs)):
                 map_train_loss  = utility.train(train_loader, map_net, optimizer=optimizer, loss_function=mse_loss, scheduler=scheduler)
@@ -174,6 +180,12 @@ for ei in tqdm(range(n_experiment)):
             train_res[m]['loss'].append(map_train_loss)
 
             print(f'MAP: TEST RMSE = {np.sqrt(map_test_loss):.4}')
+
+            if args.verbose:
+                full_train_loader = DataLoader(train_dataset, len(train_dataset))
+                train_x, _  = next(iter(full_train_loader))
+                ntk_rank, ntk_linear_dependence, ntk_shape, ck_rank, ck_linear_dependence, ck_shape = utility.rank_calc(map_net, train_x)
+                print(f'After training: NTK ({ntk_shape}) | rank: {ntk_rank}, nullity: {ntk_shape[1]-ntk_rank}, lin_dep: {ntk_linear_dependence:.3f}, CK ({ck_shape}) | rank: {ck_rank}, nullity: {ck_shape[1]-ck_rank}, lin_dep: {ck_linear_dependence}')
 
             map_pred = []
             for x,_ in test_loader:
@@ -199,10 +211,11 @@ for ei in tqdm(range(n_experiment)):
                                     mu=0.9, 
                                     verbose=True)
             train_res[m]['loss'].append(loss)
-            cuqls_posterior.HyperparameterTuning(validation_dataset, 0.01, 10000, 100, verbose=args.verbose)
+            cuqls_posterior.HyperparameterTuning(validation_dataset, 0.01, 10000, 100, verbose=args.extra_verbose)
 
             cuqls_test_preds = cuqls_posterior.test(test_dataset, test_bs=batch_size)
             scaled_test_preds = cuqls_test_preds*cuqls_posterior.scale_cal
+            print(f'Scale cal: {cuqls_posterior.scale_cal:.4}')
 
             mean_pred = cuqls_test_preds.mean(1)
             var_pred = scaled_test_preds.var(1)
@@ -220,61 +233,6 @@ for ei in tqdm(range(n_experiment)):
                                                     extra_verbose=True)
             train_res[m]['loss'].append(train_nll)
             mean_pred, var_pred = de_posterior.test(test_loader)
-
-        # elif m == 'DE':
-        #     model_list = []
-        #     opt_list = []
-        #     sched_list = []
-
-        #     for i in range(S):
-        #         model_list.append(utility.EnsembleNetwork(hidden_sizes,input_start,input_dim,args.activation).to(device=device,dtype=torch.float64))
-        #         model_list[i].apply(utility.weights_init)
-        #         if args.dataset=='yacht' or args.dataset=='kin8nm':
-        #             opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
-        #             sched_list.append(torch.optim.lr_scheduler.CosineAnnealingLR(opt_list[i], T_max=de_epochs))                  
-        #         else:
-        #             opt_list.append(torch.optim.Adam(model_list[i].parameters(), lr = de_lr, weight_decay = weight_decay))
-        #             sched_list.append(None)
-
-        #     de_train_total = 0
-        #     de_test_total = 0
-        #     de_mse_total = 0
-        #     de_t1 = time.time()
-        #     for i in tqdm(range(S)):
-        #         for epoch in range(de_epochs):
-        #             de_train_loss = utility.train_de(dataloader=train_loader, model=model_list[i], optimizer=opt_list[i], loss_function=nll, scheduler=sched_list[i])
-        #             de_test_loss, de_test_mse = utility.test_de(test_loader, model=model_list[i], my=0, sy=1, loss_function=nll, mse_loss=mse_loss)
-        #             if args.extra_verbose and epoch % 10 == 0:
-        #                 print("Epoch {} of {}".format(epoch,de_epochs))
-        #                 print("Training loss = {:.4f}".format(de_train_loss))
-        #                 print("Test loss = {:.4f}".format(de_test_loss))
-        #                 print("Test mse = {:.4f}".format(de_test_mse))
-        #                 print("\n -------------------------------------")
-        #         # import sys; sys.exit(0)
-        #         de_train_total += de_train_loss
-        #         de_test_total += de_test_loss
-        #         de_mse_total += de_test_mse
-        #     de_train_total /= S
-        #     de_test_total /= S
-        #     de_mse_total /= S
-
-        #     train_res[m]['loss'].append(de_train_total)
-
-        #     ensemble_het_mu = torch.empty((S,test_size))
-        #     ensemble_het_var = torch.empty((S,test_size))
-        #     for i in range(S):
-        #         for X,y in test_loader:
-        #             X,y = X.to(device), y.to(device)
-        #             y = y.reshape((y.shape[0],1))
-        #             mu, sig = model_list[i](X)
-        #             mu = mu
-        #             sig = sig
-        #             ensemble_het_mu[i,:] = mu.reshape(1,-1)
-        #             ensemble_het_var[i,:] = sig.reshape(1,-1)
-
-        #     mean_pred = torch.mean(ensemble_het_mu,dim=0)
-        #     var_pred = torch.mean(ensemble_het_var + torch.square(ensemble_het_mu), dim=0) - torch.square(mean_pred)
-
 
         elif m == 'LLA':
             if args.dataset == 'protein':
@@ -421,7 +379,6 @@ for ei in tqdm(range(n_experiment)):
             observed_conf, predicted_conf = utility.calibration_curve_r(test_y,mean_pred,var_pred,11)
             test_res[m]['ece'].append(torch.mean(torch.square(observed_conf - predicted_conf)).detach().cpu().item())
 
-            
             print("\nTest Prediction:")
             # t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
             # print(f"Time h:m:s: {t}")

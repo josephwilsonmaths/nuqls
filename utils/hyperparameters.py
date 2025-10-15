@@ -19,10 +19,5 @@ def get_config(fname, model, dataset):
     config_dict['nuqls_lr'] = config.getfloat(field,'nuqls_lr')
     config_dict['nuqls_bs'] = config.getint(field,'nuqls_bs')
     config_dict['nuqls_gamma'] = config.getfloat(field,'nuqls_gamma')
-    config_dict['cuqls_S'] = config.getint(field,'cuqls_S')
-    config_dict['cuqls_epoch'] = config.getint(field,'cuqls_epoch')
-    config_dict['cuqls_lr'] = config.getfloat(field,'cuqls_lr')
-    config_dict['cuqls_bs'] = config.getint(field,'cuqls_bs')
-    config_dict['cuqls_gamma'] = config.getfloat(field,'cuqls_gamma')
     return config_dict
 

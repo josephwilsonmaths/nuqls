@@ -43,6 +43,39 @@ def train_loop(dataloader, model, loss_fn, optimizer, scheduler, device='cpu', t
 
     return train_loss, correct
 
+def train_loop_binary(dataloader, model, loss_fn, optimizer, scheduler, device='cpu', train_mode=True):
+    # Set the model to training mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    if train_mode:
+        model.train()
+    else:
+        model.eval()
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)    
+    train_loss, correct = 0, 0
+    for batch, (X, y) in enumerate(dataloader):
+        X,y = X.to(device), y.to(device)
+        # Compute prediction and loss
+        pred = model(X)
+        loss = loss_fn(pred, y.to(dtype=torch.float64).unsqueeze(1))
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Evaluate metrics
+        train_loss += loss.item()
+        correct += (pred.sigmoid().round().squeeze(1) == y).type(torch.float).sum().item()
+
+    if scheduler is not None:
+        scheduler.step()
+
+    train_loss /= num_batches
+    correct /= size
+
+    return train_loss, correct
+
 
 def test_loop(dataloader, model, loss_fn, verbose=False):
     # Set the model to evaluation mode - important for batch normalization and dropout layers

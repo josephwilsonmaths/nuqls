@@ -3,13 +3,13 @@ import utils.training
 from torchvision.models import resnet50, ResNet50_Weights
 from posteriors.be.wide_resnet_batchensemble import Wide_ResNet_BatchEnsemble
 
-def get_model(name, n_outputs, n_channels):
+def get_model(name, n_outputs, n_channels, p=0):
     if name == 'lenet':
         network = LeNet5()
     if name == 'lenet_custom':
         network = LeNet5_custom()
     elif name == 'resnet9':
-        network = ResNet9(in_channels=n_channels, num_classes=n_outputs)
+        network = ResNet9(in_channels=n_channels, num_classes=n_outputs, p=p)
     elif name == 'wrn':
         network = WRN(depth=28, widening_factor=5, num_classes = n_outputs)
     elif name == 'resnet50':

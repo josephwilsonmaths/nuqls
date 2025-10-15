@@ -7,14 +7,15 @@ import copy
 def DeepEnsemble(
     network: torch.nn.Module,
     task: str = 'regression',
-    M: int = 5
+    M: int = 5,
+    target: str = 'multiclass'
     ):
 
     if task == 'regression':
         return DeepEnsembleRegression(network, M)
     
     elif task == 'classification':
-        return DeepEnsembleClassification(network, M)
+        return DeepEnsembleClassification(network, M, target)
     
     else:
         print("Invalid task choice. Valid choices: [regression, classification]")
@@ -99,13 +100,14 @@ class DeepEnsembleRegression(object):
         return mean_pred.detach(), var_pred.detach()
         
 class DeepEnsembleClassification(object):
-    def __init__(self, network, M = 5):
+    def __init__(self, network, M = 5, target = 'multiclass'):
         self.network = network
         self.device = next(network.parameters()).device
         self.M = M
         self.network_list = [copy.deepcopy(self.network) for _ in range(self.M)]
         for net in self.network_list:
             net.apply(utils.training.init_weights)
+        self.target = target
 
     def train(self, loader, lr, wd, epochs, optim_name, sched_name, verbose=False, extra_verbose=False):
         opt_list = []
@@ -124,7 +126,11 @@ class DeepEnsembleClassification(object):
         else:
             pbar = range(self.M)
 
-        nll_func = torch.nn.CrossEntropyLoss()
+
+        if self.target == 'multiclass':
+            nll_func = torch.nn.CrossEntropyLoss()
+        elif self.target == 'binary':
+            nll_func = torch.nn.BCEWithLogitsLoss()
 
         for idx in pbar:
 
@@ -134,13 +140,20 @@ class DeepEnsembleClassification(object):
                 pbar_inner = range(epochs)
 
             for epoch in pbar_inner:
-
-                train_nll, train_acc = utils.training.train_loop(dataloader=loader, 
-                                                                 model=self.network_list[idx],
-                                                                 loss_fn=nll_func,
-                                                                 optimizer=opt_list[idx],
-                                                                 scheduler=sched_list[idx],
-                                                                 device=self.device)
+                if self.target == 'multiclass':
+                    train_nll, train_acc = utils.training.train_loop(dataloader=loader, 
+                                                                    model=self.network_list[idx],
+                                                                    loss_fn=nll_func,
+                                                                    optimizer=opt_list[idx],
+                                                                    scheduler=sched_list[idx],
+                                                                    device=self.device)
+                elif self.target == 'binary':
+                    train_nll, train_acc = utils.training.train_loop_binary(dataloader=loader, 
+                                                                    model=self.network_list[idx],
+                                                                    loss_fn=nll_func,
+                                                                    optimizer=opt_list[idx],
+                                                                    scheduler=sched_list[idx],
+                                                                    device=self.device)
                 
                 if extra_verbose:
                     metrics = {'train nll': train_nll,
@@ -170,6 +183,10 @@ class DeepEnsembleClassification(object):
         ensemble_pred = torch.stack(ensemble_pred)
 
         return ensemble_pred.detach() # M x N x C
+    
+    def UncertaintyPrediction(self, loader):
+        predictions = self.test(loader) # M x N x C
+        return predictions.softmax(-1).mean(0), predictions.softmax(-1).var(0)
     
 
 def train_loop(loader, model, optimizer, nll_func, mse_func, scheduler=None, device='cpu'):

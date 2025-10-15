@@ -139,6 +139,7 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3],stride=2)
         self.pool = nn.AvgPool2d(kernel_size=4)
+        self.flatten = nn.Flatten(1,-1)
         self.linear = nn.Linear(512*block.expansion, num_classes)
         if self.p > 0:
             self.dropout = nn.Dropout(self.p)
@@ -159,7 +160,8 @@ class ResNet(nn.Module):
         out = self.layer4(out)
         # out = F.avg_pool2d(out, 4)
         out = self.pool(out)
-        out = out.view(out.size(0), -1)
+        # out = out.view(out.size(0), -1)
+        out = self.flatten(out)
         if self.p > 0:
             out = self.dropout(out)
         out = self.linear(out)

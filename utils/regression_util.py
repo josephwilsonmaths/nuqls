@@ -243,3 +243,39 @@ def test_de(dataloader, model, my, sy, loss_function, mse_loss):
 #             x = self.act(self.ml[i](x))
 #         x = self.linear(x)
 #         return x
+
+from functorch import make_functional
+from torch.func import functional_call, vmap, jacrev, jvp
+
+def rank_calc(net, train):
+
+    # Compute NTKGP
+    fnet, params = make_functional(net)
+
+    ## Compute jacobian of net, evaluated on training set
+    def fnet_single(params, x):
+        return fnet(params, x.unsqueeze(0)).squeeze(0)
+
+    def Jx(Xs):
+        J = vmap(jacrev(fnet_single), (None, 0))(params, Xs)
+        J = [j.detach().flatten(1) for j in J]
+        J = torch.cat(J,dim=1).detach()
+        return J
+
+    Jtrain = Jx(train)
+    ntk_shape = Jtrain.shape
+    ntk_linear_dependence = torch.linalg.norm(torch.eye(Jtrain.shape[1]) - torch.linalg.pinv(Jtrain) @ Jtrain)
+    ntk_rank = torch.linalg.matrix_rank(Jtrain)
+
+    def Jx(Xs):
+        J = vmap(jacrev(fnet_single), (None, 0))(params, Xs)
+        # J = [j.detach().flatten(1) for j in J]
+        # J = torch.cat(J,dim=1).detach()
+        J = J[-2].detach().flatten(1).detach() # For last-layer test
+        return J
+
+    Jtrain = Jx(train)
+    ck_linear_dependence = torch.linalg.norm(torch.eye(Jtrain.shape[1]) - torch.linalg.pinv(Jtrain) @ Jtrain)
+    ck_rank = torch.linalg.matrix_rank(Jtrain)
+    ck_shape= Jtrain.shape
+    return ntk_rank, ntk_linear_dependence, ntk_shape, ck_rank, ck_linear_dependence, ck_shape

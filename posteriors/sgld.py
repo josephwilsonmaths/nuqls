@@ -62,12 +62,6 @@ class sgld(object):
         return self.sgldmodel.predict_step(x.to(self.device), device=self.device)['logits']
 
 
-
-
-
-
-
-
 def collate_fn_tensordataset(batch):
     """Collate function for tensor dataset to our framework."""
     inputs = torch.stack([item[0] for item in batch])

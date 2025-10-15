@@ -134,7 +134,7 @@ def get_dataset(name, subsample):
             transform=transform_test_cifar
         ) 
 
-        _, val_data = torch.utils.data.random_split(training_data,[50000,10000])
+        _, val_data = torch.utils.data.random_split(training_data,[0.9,0.1])
         n_output = 10
         n_channels = 3
 

@@ -7,31 +7,44 @@ from torchmetrics.classification import MulticlassCalibrationError
 import utils.datasets as ds
 import time
 
-def compute_metrics(test_loader, test_preds, ood_test_preds, samples=True):
-    # If samples = True -> Assume that test_preds is S x N x C, in probit space, and detached, on cpu.
-    # If samples = False -> Assume that test_preds is N x C, in probit space, and detached, on cpu.
-    if samples:
-        num_classes=test_preds.shape[2]
-        mean_prediction = test_preds.mean(0); ood_mean_predictions = ood_test_preds.mean(0)
-    else:
-        num_classes=test_preds.shape[1]
-        mean_prediction = test_preds; ood_mean_predictions = ood_test_preds
-
-    ece_compute = MulticlassCalibrationError(num_classes=num_classes,n_bins=10,norm='l1')
-    loss_fn = torch.nn.NLLLoss(reduction='mean')
+def compute_metrics(test_loader, id_mean, id_var, ood_mean, ood_var, variance=True, sum=True):
     test_targets = torch.cat([y for _,y in test_loader])
+    ece_compute = MulticlassCalibrationError(num_classes=id_mean.shape[1],n_bins=10,norm='l1')
+    loss_fn = torch.nn.NLLLoss(reduction='mean')
 
-    ce = loss_fn(torch.log(mean_prediction),test_targets).item()
-    acc = (mean_prediction.argmax(1) == test_targets).type(torch.float).mean().item()
-    ece = ece_compute(mean_prediction, test_targets).cpu().item()
-    ood_auc, auc_roc = auc_metric(mean_prediction, ood_mean_predictions, logits=False)
+    ce = loss_fn(torch.log(id_mean),test_targets).item()
+    acc = (id_mean.argmax(1) == test_targets).type(torch.float).mean().item()
+    ece = ece_compute(id_mean, test_targets).cpu().item()
+    ood_auc, auc_roc = auc_metric(id_mean, ood_mean, logits=False)
 
-    if samples:
-        var_roc = aucroc(ood_test_preds.var(0).sum(1), test_preds.var(0).sum(1))
-        idc, idic = sort_preds(test_preds,test_targets)
-        var_roc_id = aucroc(idic.var(0).sum(1), idc.var(0).sum(1))
-        var_roc_ood = aucroc(ood_test_preds.var(0).sum(1), idc.var(0).sum(1))
-        vmsp_dict = sort_probabilies(test_preds, ood_test_preds, test_data=test_loader.dataset)
+    if variance:
+        var_roc = aucroc(ood_var.sum(1), id_var.sum(1))
+        index_correct = sort_preds_index(id_mean,test_targets)
+
+        if sum:
+            var_roc_id = aucroc(id_var[~index_correct,:].sum(1), id_var[index_correct,:].sum(1))
+            var_roc_ood = aucroc(ood_var.sum(1), id_var[index_correct,:].sum(1))
+
+            pi_correct_var = id_var[index_correct,:].sum(1)
+            pi_incorrect_var = id_var[~index_correct,:].sum(1)
+            po_var = ood_var.sum(1)
+        else:
+            max_index_correct = id_mean[index_correct,:].argmax(1)
+            max_index_incorrect = id_mean[~index_correct,:].argmax(1)
+            max_index_ood = ood_mean.argmax(1)
+            correct_var = id_var[index_correct,:]
+            incorrect_var = id_var[~index_correct,:]
+            pi_correct_var = correct_var[range(len(max_index_correct)),max_index_correct]
+            pi_incorrect_var = incorrect_var[range(len(max_index_incorrect)),max_index_incorrect]
+            po_var = ood_var[range(len(max_index_ood)), max_index_ood]
+
+            var_roc_id = aucroc(pi_incorrect_var, pi_correct_var)
+            var_roc_ood = aucroc(po_var, pi_correct_var)
+
+        vmsp_dict = {'id_correct': pi_correct_var,
+                    'id_incorrect': pi_incorrect_var,
+                    'ood': po_var}
+        
         return ce, acc, ece, ood_auc, auc_roc, var_roc, var_roc_id, var_roc_ood, vmsp_dict
     else:
         return ce, acc, ece, ood_auc, auc_roc
@@ -80,9 +93,13 @@ def auc_metric(id_test, ood_test, logits=False):
 
     return ood_auc_output, auc_roc_output
 
+def sort_preds_index(pi,yi):
+    return (pi.argmax(1) == yi)
+
 def sort_preds(pi,yi):
-    index = (pi.mean(0).argmax(1) == yi)
-    return pi[:,index,:], pi[:,~index,:]
+    # pi is mean prediction : n x c
+    index = sort_preds_index(pi,yi)
+    return pi[index,:], pi[~index,:]
 
 def sort_preds_logit(pi,yi):
     index = (pi.softmax(2).mean(0).argmax(1) == yi)
@@ -130,13 +147,13 @@ def add_baseline(prob_var_dict,test_data,ood_test_data):
     sample = (torch.randn((S,len(targets),10)) * scale_n).softmax(2)
     sample_ood = (torch.randn((S,len(targets),10)) * scale_n).softmax(2)
 
-    pi_correct, pi_incorrect = sort_preds(sample,targets)
+    pi_correct, pi_incorrect = sort_preds(sample.mean(0),targets)
 
-    max_index = pi_correct.mean(0).argmax(1)
-    pi_correct_var = pi_correct[:,range(len(max_index)),max_index].var(0)
+    max_index = pi_correct.argmax(1)
+    pi_correct_var = pi_correct[range(len(max_index)),max_index].var(0)
 
-    max_index = pi_incorrect.mean(0).argmax(1)
-    pi_incorrect_var = pi_incorrect[:,range(len(max_index)),max_index].var(0)
+    max_index = pi_incorrect.argmax(1)
+    pi_incorrect_var = pi_incorrect[range(len(max_index)),max_index].var(0)
 
     max_index = sample_ood.mean(0).argmax(1)
     po_var = sample_ood[:,range(len(max_index)),max_index].var(0)
@@ -174,11 +191,14 @@ def ax_violin(ax,var_dict,set_sigma=False, legend_true=False, fs = 12, title=Non
         np.arange(len(id_correct_var_list)))*2-0.6, 
                                 points=1000, widths=0.6,
                      showmeans=False, showextrema=False, showmedians=True)
-    id_vars_plot_2 = ax.violinplot(id_incorrect_var_list,
-                                positions=np.array(
-        np.arange(len(id_incorrect_var_list)))*2, 
-                                points=1000, widths=0.6,
-                     showmeans=False, showextrema=False, showmedians=True)
+    try:
+        id_vars_plot_2 = ax.violinplot(id_incorrect_var_list,
+                                    positions=np.array(
+            np.arange(len(id_incorrect_var_list)))*2, 
+                                    points=1000, widths=0.6,
+                        showmeans=False, showextrema=False, showmedians=True)
+    except:
+        id_vars_plot_2 = None
     ood_vars_plot = ax.violinplot(ood_var_list,
                                 positions=np.array(
         np.arange(len(ood_var_list)))*2+0.6,
@@ -190,10 +210,11 @@ def ax_violin(ax,var_dict,set_sigma=False, legend_true=False, fs = 12, title=Non
         pc.set_edgecolor('black')
         pc.set_alpha(0.4)
 
-    for pc in id_vars_plot_2['bodies']:
-        # pc.set_facecolor('#D43F3A')
-        pc.set_edgecolor('black')
-        pc.set_alpha(0.4)
+    if id_vars_plot_2 is not None:
+        for pc in id_vars_plot_2['bodies']:
+            # pc.set_facecolor('#D43F3A')
+            pc.set_edgecolor('black')
+            pc.set_alpha(0.4)
 
     for pc in ood_vars_plot['bodies']:
         # pc.set_facecolor('#D43F3A')
@@ -212,7 +233,8 @@ def ax_violin(ax,var_dict,set_sigma=False, legend_true=False, fs = 12, title=Non
     
     # # setting colors for each groups
     define_box_properties(id_vars_plot, '#008000', 'ID Correct')
-    define_box_properties(id_vars_plot_2, '#D7191C', 'ID Incorrect')
+    if id_vars_plot_2 is not None:
+        define_box_properties(id_vars_plot_2, '#D7191C', 'ID Incorrect')
     define_box_properties(ood_vars_plot, '#2C7BB6', 'OOD')
     
     ax.set_xticks(np.arange(0, len(ticks) * 2, 2), ticks)
@@ -234,40 +256,66 @@ def plot_vmsp(prob_dict,title,save_fig):
 
 def print_results(m, test_res, ei, train_res=None):
     ### print (train and) test prediction results
-    print(f"\n--- Method {m} ---")
-    if train_res is not None:
-        print(f"Train Results -- Loss: {train_res[m]['nll'][ei]:.3f}; Train Acc: {train_res[m]['acc'][ei]:.1%}")
-    t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
-    s = f"Test Results -- Acc.: {test_res[m]['acc'][ei]:.1%}; ECE: {test_res[m]['ece'][ei]:.1%}; NLL: {test_res[m]['nll'][ei]:.3}; OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%};"
-    if m != 'MAP':
-        s += f" VAR-ROC: {test_res[m]['varroc'][ei]:.1%}; VAR-ROC-ID: {test_res[m]['varroc_id'][ei]:.1%}; VAR-ROC-OOD: {test_res[m]['varroc_ood'][ei]:.1%}; VARROC-ROT: {test_res[m]['varroc_rot'][ei]:.1%};"
-    s += f" Time h:m:s: {t}"
-    print(s + "\n")
-
-
-
-def predictions_tolerance(preds, targets, tau, deterministic=False):
-    # Confidence tolerance
-    if deterministic:
-        conf = preds.max(-1)[0]
-        conf_pred = preds[conf >= tau,:]
+    if ei is not None:
+        print(f"\n--- Method {m} ---")
+        if train_res is not None:
+            print(f"Train Results -- Loss: {train_res[m]['nll'][ei]:.3f}; Train Acc: {train_res[m]['acc'][ei]:.1%}")
+        t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time'][ei]))
+        s = f"Test Results -- Acc.: {test_res[m]['acc'][ei]:.1%}; ECE: {test_res[m]['ece'][ei]:.1%}; NLL: {test_res[m]['nll'][ei]:.3}; OOD-AUC: {test_res[m]['oodauc'][ei]:.1%}; AUC-ROC: {test_res[m]['aucroc'][ei]:.1%};"
+        if m != 'MAP':
+            s += f" VAR-ROC: {test_res[m]['varroc'][ei]:.1%}; VAR-ROC-ID: {test_res[m]['varroc_id'][ei]:.1%}; VAR-ROC-OOD: {test_res[m]['varroc_ood'][ei]:.1%}; VARROC-ROT: {test_res[m]['varroc_rot'][ei]:.1%};"
+        s += f" Time h:m:s: {t}"
+        print(s + "\n")
     else:
-        conf = preds.mean(0).max(-1)[0]
-        conf_pred = preds[:,conf >= tau,:]
+        print(f"\n--- Method {m} ---")
+        if train_res is not None:
+            print(f"Train Results -- SQ Loss: {train_res[m]['sq loss']:.3f}; CE Loss: {train_res[m]['ce loss']:.3f}; Acc: {train_res[m]['acc']:.3f}")
+        t = time.strftime("%H:%M:%S", time.gmtime(test_res[m]['time']))
+        s = f"Test Results -- Acc.: {test_res[m]['acc']:.1%}; ECE: {test_res[m]['ece']:.1%}; NLL: {test_res[m]['nll']:.3}; OOD-AUC: {test_res[m]['oodauc']:.1%}; AUC-ROC: {test_res[m]['aucroc']:.1%};"
+        if m != 'MAP':
+            s += f" VAR-ROC: {test_res[m]['varroc']:.1%}; VAR-ROC-ID: {test_res[m]['varroc_id']:.1%}; VAR-ROC-OOD: {test_res[m]['varroc_ood']:.1%}; VARROC-ROT: {test_res[m]['varroc_rot']:.1%};"
+        s += f" Time h:m:s: {t}"
+        print(s + "\n")
 
+def write_results_nuqls(results : str, train_res : dict, test_res : dict, epoch, gamma):
+    with open(results, 'a') as f:
+        f.write(f'Epochs: {epoch}, Gamma: {gamma}\n')
+        f.write('---------------------------------------------------------------------\n')
+        f.write("Train Results:\n")
+        for m in train_res.keys():
+            f.write(f"{m}: ")
+            for k in train_res[m].keys():
+                f.write(f"{k}: {train_res[m][k]:.4}; ")
+            f.write('\n')
+        f.write("\nTest Prediction:\n")
+        for m in test_res.keys():
+            f.write(f"{m}: ")
+            for k in test_res[m].keys():
+                f.write(f"{k}: {test_res[m][k]:.4}; ")
+            f.write('\n')
+        f.write('\n')
+        f.close()
+
+
+
+def predictions_tolerance(mean, variance, targets, tau, deterministic=False):
+    # Confidence tolerance
+    conf = mean.max(-1)[0]
+    conf_pred = mean[conf >= tau,:]
     conf_targets = targets[conf >= tau]
 
     if not deterministic:
-        var = preds.var(0).sum(-1); vm = var.max()
+        v = variance.sum(1)
+        vm = v.max()
         # Var tolerance
-        var_pred = preds[:,var < vm*(1-tau),:]
-        var_targets = targets[var < vm*(1-tau)]
+        var_pred = mean[v < vm*(1-tau),:]
+        var_targets = targets[v < vm*(1-tau)]
 
         return conf_pred, conf_targets, var_pred, var_targets
     else:
         return conf_pred, conf_targets 
 
-def tolerance_acc(preds, test_loader, deterministic=False):
+def tolerance_acc(test_loader, mean, variance, deterministic=False):
     targets = torch.cat([y for _,y in test_loader])
 
     tau_range = torch.linspace(0,1,100)
@@ -276,48 +324,70 @@ def tolerance_acc(preds, test_loader, deterministic=False):
         acc_var = []
 
     for tau in tau_range:
-        pred_target = predictions_tolerance(preds, targets, tau, deterministic)
-        # conf_pred, conf_targets, var_pred, var_targets = predictions_tolerance(preds, targets, tau)
+        pred_target = predictions_tolerance(mean, variance, targets, tau, deterministic)
         if deterministic:
             conf_pred, conf_targets = pred_target
             acc_conf.append((conf_pred.argmax(-1) == conf_targets).type(torch.float).mean().item())
         else:
             conf_pred, conf_targets, var_pred, var_targets = pred_target 
-            acc_conf.append((conf_pred.mean(0).argmax(-1) == conf_targets).type(torch.float).mean().item())
-            acc_var.append((var_pred.mean(0).argmax(-1) == var_targets).type(torch.float).mean().item())
+            acc_conf.append((conf_pred.argmax(-1) == conf_targets).type(torch.float).mean().item())
+            acc_var.append((var_pred.argmax(-1) == var_targets).type(torch.float).mean().item())
 
     if deterministic:
         return acc_conf
     else:
         return acc_conf, acc_var
     
-def tolerance_plot(acc_dict, save_fig):
-    f,(ax) = plt.subplots(1,2, figsize = (10,4))
-    f.subplots_adjust(wspace=0.3)
+def tolerance_plot(acc_dict, save_fig, title = None, confidence = False):
+    if confidence:
+        f,(ax) = plt.subplots(1,2, figsize = (10,4))
+        f.subplots_adjust(wspace=0.3)
 
-    ax[0].set_ylabel('Accuracy')
-    ax[0].set_xlabel(r"$\tau$")
+        ax[0].set_ylabel('Accuracy')
+        ax[0].set_xlabel(r"$\tau$")
 
-    ax[1].set_ylabel('Accuracy')
-    ax[1].set_xlabel(r"$\tau$")
+        ax[1].set_ylabel('Accuracy')
+        ax[1].set_xlabel(r"$\tau$")
+    else:
+        f,ax = plt.subplots(1,1, figsize = (5,4))
+        f.subplots_adjust(wspace=0.3)
+
+        ax.set_ylabel('Accuracy')
+        ax.set_xlabel(r"$\tau$")
 
     for m in acc_dict.keys():
-        for idx,k in enumerate(acc_dict[m].keys()):
-            acc = acc_dict[m][k]
-            ax[idx].plot(np.linspace(0,1,len(acc)), acc, label=m)
+        if confidence:
+            for idx,k in enumerate(acc_dict[m].keys()):
+                acc = acc_dict[m][k]
+                ax[idx].plot(np.linspace(0,1,len(acc)), acc, label=m)
+        else:
+            if m == 'MAP':
+                continue
+            acc = acc_dict[m]['var']
+            ax.plot(np.linspace(0,1,len(acc)), acc, label=m)
 
-    ax[0].legend()
-    ax[1].legend()
+    if confidence:
+        ax[0].legend()
+        ax[1].legend()
+    else:
+        ax.legend()
 
+    if title is not None:
+        if confidence:
+            ax[0].set_title(title)
+            ax[1].set_title(title)
+        else:
+            ax.set_title(title)
+        
     f.savefig(save_fig,format='pdf',bbox_inches='tight')
 
-def rotated_dataset(id_predictions_probit, pred_func, dataset):
+def rotated_dataset(id_var, var_func, dataset):
     '''
     Input:
-        id_predictions_probit: predictions on MNIST test set, size S x N x C, in PROBIT space. 
+        id_var: variance on MNIST test set, size N x C, in PROBIT space. 
 
-        pred_func: (function) that takes dataset (torch.utils.data.Dataset), and outputs S x N x C in logits space, where
-                    S is number of mc samples, N is len(dataset), and C is number of classes
+        var_func: (function) that takes dataset (torch.utils.data.Dataset), and outputs variance of size N x C in probit space, where
+                    N is len(dataset), and C is number of classes
 
         dataset: (str) in ['mnist','fmnist']
 
@@ -334,15 +404,117 @@ def rotated_dataset(id_predictions_probit, pred_func, dataset):
 
     angles = [15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180]
     varroc = 0
-    acc = []
     for angle in angles:
         dataset_rot = dataset_func(angle)
-        rot_loader = DataLoader(dataset_rot, 100)
-        rot_targets = torch.cat([y for _,y in rot_loader])
-        predictions_rot = pred_func(dataset_rot) # S x N x C, logits
-        predictions_rot = predictions_rot.softmax(-1)
-        score = ood_auc(id_predictions_probit.var(0).sum(-1).detach().cpu(), predictions_rot.var(0).sum(-1).detach().cpu())
+        var_rot = var_func(dataset_rot).cpu() # N x C, probits
+        score = ood_auc(id_var.sum(1), var_rot.sum(1))
         varroc += score
-        acc.append((predictions_rot.mean(0).argmax(-1) == rot_targets).type(torch.float).mean().item())
     varroc /= len(angles)
-    return varroc, acc
+    return varroc
+
+from matplotlib import colors
+
+def plot_var(
+    X_test,
+    Y_test,
+    y_pred,
+    test_grid_points,
+    sum_var = False,
+    log_on = False,
+    cut_off = None,
+    alpha = 1
+) -> plt.Figure:
+    """Plot the classification results and the associated uncertainty.
+
+    Args:
+        X_test: The input features.
+        Y_test: The true labels.
+        y_pred: The predicted labels.
+        test_grid_points: The grid of test points.
+        pred_uct: The uncertainty of the predictions.
+    """
+    fig, axs = plt.subplots(1, 1, figsize=(4, 4))
+    cm = plt.cm.get_cmap("plasma")
+
+    grid_size = int(np.sqrt(test_grid_points.shape[0]))
+    xx = test_grid_points[:, 0].reshape(grid_size, grid_size)
+    yy = test_grid_points[:, 1].reshape(grid_size, grid_size)
+
+    # Create a scatter plot of the input features, colored by the uncertainty
+    if sum_var:
+        unc = y_pred.var(0).sum(-1)
+    else:
+        unc = y_pred.var(0).max(-1)[0]
+    if log_on:
+        unc = torch.log(unc)
+    unc -= unc.min()
+    unc /= unc.max()
+    if cut_off is not None:
+        unc[unc > cut_off] = 1
+    im2 = axs.imshow(
+        unc.reshape(grid_size, grid_size),
+        alpha=0.8,
+        cmap=cm,
+        origin="lower",
+        extent=[xx.min(), xx.max(), yy.min(), yy.max()],
+        interpolation="bicubic",
+        aspect="auto",
+    )
+    axs.scatter(
+        X_test[:, 0], X_test[:, 1], c=Y_test, cmap=cm, edgecolors="black", alpha=alpha
+    )
+    # axs.set_title("Uncertainty - Variance")
+    fig.colorbar(im2, ax=axs, fraction=0.05, pad=0.008)
+    return fig
+
+def plot_var_ax(
+    X_test,
+    Y_test,
+    y_pred,
+    test_grid_points,
+    ax,
+    logit = True,
+    sigmoid_on = False,
+    cut_off = None,
+    alpha = 1
+):
+    """Plot the classification results and the associated uncertainty.
+
+    Args:
+        X_test: The input features.
+        Y_test: The true labels.
+        y_pred: The predicted labels.
+        test_grid_points: The grid of test points.
+        pred_uct: The uncertainty of the predictions.
+    """
+    cm = plt.cm.get_cmap("plasma")
+    grid_size = int(np.sqrt(test_grid_points.shape[0]))
+    xx = test_grid_points[:, 0].reshape(grid_size, grid_size)
+    yy = test_grid_points[:, 1].reshape(grid_size, grid_size)
+
+    # Create a scatter plot of the input features, colored by the uncertainty
+    if logit:
+        unc = y_pred.var(0).max(-1)[0]
+        unc = torch.log(unc)
+    else:
+        if sigmoid_on:
+            unc = y_pred.sigmoid().var(0).max(-1)[0]
+        else:
+            unc = y_pred.softmax(-1).var(0).max(-1)[0]
+    unc -= unc.min()
+    unc /= unc.max()
+    if cut_off is not None:
+        unc[unc > cut_off] = 1
+    im = ax.imshow(
+        unc.reshape(grid_size, grid_size),
+        alpha=0.8,
+        cmap=cm,
+        origin="lower",
+        extent=[xx.min(), xx.max(), yy.min(), yy.max()],
+        interpolation="bicubic",
+        aspect="auto",
+    )
+    ax.scatter(
+        X_test[:, 0], X_test[:, 1], c=Y_test, cmap=cm, edgecolors="black", alpha = alpha
+    )
+    return ax, im
