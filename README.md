@@ -1,5 +1,5 @@
 # Uncertainty Quantification with the Empirical Neural Tangent Kernel
-Code repository for experiments and figures in the main text of the paper ["Uncertainty Quantification with the Empirical Neural Tangent Kernel"](https://arxiv.org/pdf/2502.02870) .
+Code repository for experiments and figures in the main text of the paper ["Uncertainty Quantification with the Empirical Neural Tangent Kernel"](https://arxiv.org/pdf/2502.02870).
 
 ## Setup
 We use **Python** `3.11`.
